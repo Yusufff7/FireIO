@@ -25,6 +25,7 @@ import {
   type ResolveAttempt,
 } from '../addons/streamSelection';
 import { getSkipTimes, type SkipTimes } from '../addons/skipTimes';
+import { MkvMseSession } from '../player/mkvMse';
 import { getHistorySync, recordWatched, resumePositionFor, saveProgress } from '../storage/history';
 import {
   DELAY_STEP,
@@ -273,6 +274,11 @@ export function PlayerScreen({ route, navigation }: Props) {
     episodeLabel && title.endsWith(episodeLabel) ? title.slice(0, -episodeLabel.length).trim() : title;
 
   const playerRef = useRef<VideoPlayer | undefined>(undefined);
+  // Set only when the current source is being played through the MSE path
+  // (see mkvMse.ts) instead of a direct `.src` assignment — null means the
+  // ordinary progressive-URL path is active, which is the common case for
+  // any source with an MP4 alternative.
+  const mseSessionRef = useRef<MkvMseSession | null>(null);
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string>();
   const [playing, setPlaying] = useState(false);
@@ -315,6 +321,24 @@ export function PlayerScreen({ route, navigation }: Props) {
   const bumpActivity = useCallback(() => {
     setControlsVisible(true);
     setActivityTick(t => t + 1);
+  }, []);
+
+  // TEMPORARY diagnostic: does this platform's MediaSource actually accept
+  // video/x-matroska, or does the JS-side MimeTypeRegistry just claim it
+  // does without the native pipeline backing it up? Remove after checking.
+  useEffect(() => {
+    try {
+      const MS = require('@amazon-devices/react-native-w3cmedia').MediaSource;
+      const results = [
+        'video/x-matroska; codecs="avc1.640028"',
+        'video/x-matroska; codecs="avc1.640028,mp4a.40.2"',
+        'video/x-matroska; codecs="hev1.1.6.L93.90"',
+        'video/x-matroska',
+      ].map(t => `${t} => ${MS?.isTypeSupported?.(t)}`);
+      console.warn('MSEDIAG ' + results.join(' | '));
+    } catch (e) {
+      console.warn('MSEDIAG threw', String(e));
+    }
   }, []);
 
   // --- Source resolution -----------------------------------------------
@@ -469,6 +493,7 @@ export function PlayerScreen({ route, navigation }: Props) {
     let watchdog: ReturnType<typeof setTimeout> | undefined;
     const p = new VideoPlayer();
     playerRef.current = p;
+    mseSessionRef.current = null;
 
     p.initialize()
       .then(async () => {
@@ -490,10 +515,39 @@ export function PlayerScreen({ route, navigation }: Props) {
           failThisSource(describeMediaError((p as any).error));
         });
 
+        // MKV sources get one attempt through the MSE path first — the only
+        // way this platform's native pipeline can seek Matroska reliably
+        // (see mkvMse.ts for the full story). A source with no video track
+        // MSE can play, or whose codecs this platform's MSE doesn't
+        // support, or that errors while probing, all fall straight through
+        // to the exact same direct-URL `.src` assignment used for
+        // everything else — MSE is strictly additive, never a hard
+        // dependency for playback to start.
+        const isMkv = resolvedStream ? parseReleaseInfo(resolvedStream).container === 'MKV' : false;
+        let mseReady = false;
+        if (isMkv) {
+          const session = new MkvMseSession(resolvedUrl);
+          try {
+            mseReady = await session.prepare(p as any, () => {
+              const el = playerRef.current as any;
+              return typeof el?.currentTime === 'number' ? el.currentTime : 0;
+            });
+          } catch (e) {
+            console.warn('MkvMseSession: prepare threw, falling back to direct URL —', e);
+            mseReady = false;
+          }
+          if (mseReady && !cancelled) {
+            mseSessionRef.current = session;
+          } else {
+            session.dispose();
+          }
+        }
+        if (cancelled) return;
+
         // Guard the src assignment: the known failure mode on an unsupported
         // codec/container is a crash, not a clean error event.
         try {
-          p.src = resolvedUrl;
+          if (!mseReady) p.src = resolvedUrl;
         } catch (e) {
           failThisSource(String(e));
           return;
@@ -605,6 +659,8 @@ export function PlayerScreen({ route, navigation }: Props) {
     return () => {
       cancelled = true;
       if (watchdog !== undefined) clearTimeout(watchdog);
+      mseSessionRef.current?.dispose();
+      mseSessionRef.current = null;
       playerRef.current?.pause?.();
       playerRef.current?.deinitialize?.().catch(() => {});
     };
@@ -759,10 +815,10 @@ export function PlayerScreen({ route, navigation }: Props) {
   const commitTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const settleTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
-  const commitSeek = useCallback(() => {
-    const p = playerRef.current as any;
-    const target = seekTargetRef.current;
-    if (target === null) return;
+  // Extracted so both the direct-URL and MSE-gated paths in commitSeek below
+  // go through the exact same write — see the comments there for why this
+  // has to be a single bare `currentTime` write and nothing more.
+  const doCommitWrite = (p: any, target: number) => {
     if (p) {
       // Bare write, no readiness gate here. A gate was added for a while
       // (wait for readyState >= 4 before writing, to protect against the
@@ -802,13 +858,35 @@ export function PlayerScreen({ route, navigation }: Props) {
         console.warn('PlayerScreen: seek failed', e, p?.error);
       }
     }
-    // Hand position tracking back to the poll once the element has had a
-    // moment to actually move. Deliberately does NOT re-issue the seek —
-    // whatever the element reports after this is the truth.
-    if (settleTimerRef.current) clearTimeout(settleTimerRef.current);
-    settleTimerRef.current = setTimeout(() => {
-      seekTargetRef.current = null;
-    }, SEEK_SETTLE_MS);
+  };
+
+  const commitSeek = useCallback(() => {
+    const p = playerRef.current as any;
+    const target = seekTargetRef.current;
+    if (target === null) return;
+
+    const writeAndSettle = () => {
+      doCommitWrite(p, target);
+      if (settleTimerRef.current) clearTimeout(settleTimerRef.current);
+      settleTimerRef.current = setTimeout(() => {
+        seekTargetRef.current = null;
+      }, SEEK_SETTLE_MS);
+    };
+
+    // MSE-backed sources need the SourceBuffer to actually have data
+    // covering the target before the write below means anything — the
+    // native pipeline only ever plays whatever we've already appended, it
+    // never fetches or seeks the raw URL itself. Direct-URL sources (the
+    // common case) skip straight to the same bare write as always.
+    const mse = mseSessionRef.current;
+    if (mse) {
+      mse
+        .prepareForSeek(target)
+        .catch(e => console.warn('MkvMseSession: seek prep failed, writing anyway —', e))
+        .finally(writeAndSettle);
+      return;
+    }
+    writeAndSettle();
   }, []);
 
   // Absolute seek. Every seek in the screen funnels through here so they all

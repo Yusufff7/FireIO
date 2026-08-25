@@ -21,6 +21,7 @@
   "dependencies": {
     "@amazon-devices/kepler-media-controls": "^1.0.25",
     "@amazon-devices/keplermediadescriptor": "^1.1.17",
+    "@amazon-devices/mkvdemuxmodule": "file:../MkvDemuxModule",
     "@amazon-devices/react-native-async-storage__async-storage": "^2.1.9000000001",
     "@amazon-devices/react-native-gesture-handler": "^4.0.1",
     "@amazon-devices/react-native-kepler": "~4.0.0",
