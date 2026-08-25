@@ -323,23 +323,6 @@ export function PlayerScreen({ route, navigation }: Props) {
     setActivityTick(t => t + 1);
   }, []);
 
-  // TEMPORARY diagnostic: does this platform's MediaSource actually accept
-  // video/x-matroska, or does the JS-side MimeTypeRegistry just claim it
-  // does without the native pipeline backing it up? Remove after checking.
-  useEffect(() => {
-    try {
-      const MS = require('@amazon-devices/react-native-w3cmedia').MediaSource;
-      const results = [
-        'video/x-matroska; codecs="avc1.640028"',
-        'video/x-matroska; codecs="avc1.640028,mp4a.40.2"',
-        'video/x-matroska; codecs="hev1.1.6.L93.90"',
-        'video/x-matroska',
-      ].map(t => `${t} => ${MS?.isTypeSupported?.(t)}`);
-      console.warn('MSEDIAG ' + results.join(' | '));
-    } catch (e) {
-      console.warn('MSEDIAG threw', String(e));
-    }
-  }, []);
 
   // --- Source resolution -----------------------------------------------
   // Every source for this id/type is fetched once, bucketed by audio
@@ -515,10 +498,14 @@ export function PlayerScreen({ route, navigation }: Props) {
           failThisSource(describeMediaError((p as any).error));
         });
 
-        // MKV sources get one attempt through the MSE path first — the only
-        // way this platform's native pipeline can seek Matroska reliably
-        // (see mkvMse.ts for the full story). A source with no video track
-        // MSE can play, or whose codecs this platform's MSE doesn't
+        // MKV sources get one attempt through the MSE+remux path first —
+        // this platform's native pipeline can't seek Matroska-demuxed
+        // content at all (confirmed identically over both a direct URL and
+        // MSE fed raw Matroska bytes; also confirmed NOT codec-specific,
+        // since HEVC-in-MP4 seeks fine), so mkvMse.ts remuxes into
+        // fragmented MP4 on the fly and feeds MSE that instead — see
+        // mkvMse.ts for the full story. A source with no remuxable video
+        // track, or whose resulting MP4 codecs this platform's MSE doesn't
         // support, or that errors while probing, all fall straight through
         // to the exact same direct-URL `.src` assignment used for
         // everything else — MSE is strictly additive, never a hard
