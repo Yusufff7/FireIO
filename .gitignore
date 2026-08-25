@@ -1,0 +1,16 @@
+*.iml
+*.swp
+.idea
+.DS_Store
+.vscode
+.tmp
+
+dist
+build
+node_modules
+CMakeUserPresets.json
+npm-debug.log
+
+# Real TorBox API key + addon URLs — see localDefaults.example.ts for the
+# committed template.
+src/storage/localDefaults.ts

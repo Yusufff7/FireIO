@@ -1,0 +1,128 @@
+schema-version = 1
+
+[package]
+title = "FireIO"
+version = "0.1.0"
+build_number = 1
+id = "com.yusuf.stremiovega"
+# Must be the '@image/<file>' form, resolved against assets/image/ — vpt
+# rejects any other shape. The package id deliberately stays as-is: changing
+# it would read as a different app to the device and orphan the installed one.
+icon = "@image/icon.png"
+
+[os.version]
+min = "1.2"
+target = "1.2"
+
+[needs]
+[[needs.module]]
+id = "/com.amazon.vega.os@IVega_1_2"
+[[needs.privilege]]
+id = "com.amazon.network.privilege.net-info"
+
+[[needs.module]]
+id = "/com.amazon.kepler.kepler_media_controls_1@IKeplerMediaControls_0"
+
+[[needs.module]]
+id = "/com.amazon.kepler.keplermediadescriptor_1@IKeplermediadescriptor_1"
+
+[[needs.module]]
+id = "/com.amazon.kepler.async_storage__async_storage_2@IAsyncStorage__AsyncStorage_1"
+
+[[needs.module]]
+id = "/com.amazon.kepler.gesture_handler_4@IGestureHandler_0"
+
+[[needs.module]]
+id = "/com.amazon.kepler.keplerscript_4@IKeplerScript_0"
+
+[[needs.module]]
+id = "/com.amazon.kepler.reanimated_4@IReanimated_0"
+
+[[needs.module]]
+id = "/com.amazon.kepler.safe_area_context_8@ISafeAreaContext_0"
+
+[[needs.module]]
+id = "/com.amazon.kepler.screens_3@IScreens_0"
+
+[[needs.module]]
+id = "/com.amazon.kepler.w3cmedia_2@IW3cmedia_3"
+
+[[needs.module]]
+id = "/com.amazon.kepler.worklets_1@IWorklets_0"
+
+[[needs.module]]
+id = "/com.amazon.kepler.navigation__core_8@INavigation__Core_0"
+
+[[needs.module]]
+id = "/com.amazon.kepler.navigation__elements_8@INavigation__Elements_0"
+
+[[needs.module]]
+id = "/com.amazon.kepler.navigation__native_8@INavigation__Native_0"
+
+[[needs.module]]
+id = "/com.amazon.kepler.navigation__native_stack_8@INavigation__NativeStack_0"
+
+[[needs.module]]
+id = "/com.amazon.kepler.navigation__routers_8@INavigation__Routers_0"
+
+[[needs.module]]
+id = "/com.amazon.kepler.shopify__flash_list_2@IShopify__FlashList_0"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[components]
+[[components.interactive]]
+id = "com.yusuf.stremiovega.main"
+runtime-module = "/com.amazon.kepler.runtime.react_native_kepler_4@IReactNativeKepler_0"
+launch-type = "singleton"
+categories = ["com.amazon.category.main"]
+
+[wants]
+# Media playback
+[[wants.service]]
+id = "com.amazon.media.server"
+[[wants.service]]
+id = "com.amazon.mediametrics.service"
+[[wants.service]]
+id = "com.amazon.mediabuffer.service"
+[[wants.service]]
+id = "com.amazon.mediatransform.service"
+# Media controls / now-playing session
+[[wants.service]]
+id = "com.amazon.media.playersession.service"
+# Audio
+[[wants.service]]
+id = "com.amazon.audio.stream"
+[[wants.service]]
+id = "com.amazon.audio.control"
+[[wants.service]]
+id = "com.amazon.audio.system"
+# Remote button events
+[[wants.service]]
+id = "com.amazon.inputd.service"
+# On-screen keyboard (search + settings text entry)
+[[wants.service]]
+id = "com.amazon.inputmethod.service"
+# GIPC shared memory used by A/V playback
+[[wants.service]]
+id = "com.amazon.gipc.uuid.*"
+# Network state
+[[wants.service]]
+id = "com.amazon.network.service"
+# Accessibility
+[[wants.privilege]]
+id = "com.amazon.devconf.privilege.accessibility"
