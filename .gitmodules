@@ -1,0 +1,6 @@
+[submodule "MkvDemuxModule/third_party/libebml"]
+	path = MkvDemuxModule/third_party/libebml
+	url = https://github.com/Matroska-Org/libebml.git
+[submodule "MkvDemuxModule/third_party/libmatroska"]
+	path = MkvDemuxModule/third_party/libmatroska
+	url = https://github.com/Matroska-Org/libmatroska.git

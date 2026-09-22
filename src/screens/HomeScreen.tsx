@@ -515,7 +515,7 @@ export function HomeScreen({ navigation }: Props) {
   // with the remembered language/resolution as a PREFERENCE; Player walks
   // the current source list starting there, falling back through the rest
   // of the normal priority order if that exact combination isn't available
-  // any more (TorBox's cache and indexer results shift day to day, so
+  // any more (provider caches and indexer results shift day to day, so
   // pinning to one exact release just meant "resume" broke the moment that
   // release disappeared). The "Trying source" progress UI lives on Player
   // now too, so there's nothing left for this screen to show while resuming
@@ -528,7 +528,6 @@ export function HomeScreen({ navigation }: Props) {
         type: entry.type,
         title: entry.episodeLabel ? `${entry.name} ${entry.episodeLabel}` : entry.name,
         isAnime: entry.isAnime,
-        preferredLanguage: entry.lastLanguage,
         preferredResolution: entry.lastResolution,
         poster: entry.poster,
         background: entry.background,
@@ -618,7 +617,7 @@ export function HomeScreen({ navigation }: Props) {
       {!configured && (
         <View style={styles.banner}>
           <Text style={styles.bannerText}>
-            No stream sources configured. Set your Torrentio and/or Comet URLs in src/storage/localDefaults.ts.
+            No stream sources configured. Add addon URLs to streamAddonUrls in src/storage/localDefaults.ts.
           </Text>
         </View>
       )}

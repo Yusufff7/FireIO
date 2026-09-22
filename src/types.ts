@@ -78,20 +78,20 @@ export type RootStackParamList = {
     title: string;
     id: string;
     type: MediaType;
-    // Gates the language-bucketing heuristic in streamSelection.ts: without
-    // a Dual/English-dub tag, an anime release is assumed Japanese-audio by
-    // scene convention, but that assumption is actively wrong for
-    // non-anime, where an untagged release is just English.
     isAnime?: boolean;
     // Tried first, with normal fallback through the rest of the priority
-    // order if unavailable or every candidate in it fails — what Continue
+    // order if unavailable or every candidate fails — what Continue
     // Watching and "next episode" pass so playback stays roughly the same
-    // quality/language without needing the exact same release to still
-    // exist. Deliberately NOT an exact source/release match — TorBox's
-    // cache and indexer results shift day to day, so pinning to one
-    // specific stream just meant "resume" broke the moment that one
-    // disappeared.
-    preferredLanguage?: 'dual' | 'jpn' | 'eng' | 'other';
+    // quality without needing the exact same release to still exist.
+    // Deliberately NOT an exact source/release match — provider caches and
+    // indexer results shift day to day, so pinning to one specific stream
+    // just meant "resume" broke the moment that one disappeared.
+    //
+    // No language equivalent: MKV releases now expose their own embedded
+    // audio tracks (see PlayerScreen's Audio Track menu, backed by
+    // MkvMseSession), which is real per-file language selection instead of
+    // a scene-tag guess at the release-picking level — so language is no
+    // longer a dimension streamSelection.ts orders or remembers by.
     preferredResolution?: string;
     poster?: string;
     background?: string;
@@ -114,14 +114,11 @@ export type HistoryEntry = Meta & {
   // page); this is the full `tt…:season:episode` id needed to resume the
   // exact episode and to look up its sources.
   episodeId?: string;
-  // What Continue Watching hands Player as its preferred language/
-  // resolution when resuming — mirrors Player.preferredLanguage's own
-  // literal union (kept inline here rather than imported, to avoid
-  // types.ts depending on addons/streamSelection.ts). Not an exact release
-  // pin: resuming re-walks the current source list with this as a
-  // preference and the normal fallback behind it, so a resume still works
-  // even if the exact release that was playing is no longer available.
-  lastLanguage?: 'dual' | 'jpn' | 'eng' | 'other';
+  // What Continue Watching hands Player as its preferred resolution when
+  // resuming. Not an exact release pin: resuming re-walks the current
+  // source list with this as a preference and the normal fallback behind
+  // it, so a resume still works even if the exact release that was playing
+  // is no longer available.
   lastResolution?: string;
   // Needed to resume correctly: without this, a resume for an anime title
   // has no way to know the Japanese-default heuristic should apply.

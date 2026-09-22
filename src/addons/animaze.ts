@@ -6,7 +6,7 @@ import { getSettingsSync } from '../storage/settings';
 // plain IMDB ids (verified: tt28919914 resolves on Cinemeta with full
 // description/genres/videos), so once a title is selected, everything
 // downstream — Detail, Sources, Player — reuses the existing
-// Cinemeta/Torrentio/Comet pipeline unchanged. No new detail-page logic
+// Metadata/stream addon pipeline unchanged. No new detail-page logic
 // needed, just extra Home rows.
 const CATALOGS: Array<{ id: string; title: string }> = [
   { id: 'trending-now-anilist', title: 'Trending Anime' },

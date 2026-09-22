@@ -31,34 +31,46 @@ export const meta = (type: MediaType, id: string): Promise<Meta | null> => {
     .catch(() => null);
 };
 
-// Comet injects non-playable control rows (e.g. "[TB🔄] Comet Sync") that
-// trigger an account rescan. They return a plausible-looking video/mp4
-// content type, so they must be filtered explicitly — verified live, see
-// PLAN.md §5.
+// Some addons inject non-playable "control" rows (account rescan triggers and
+// similar) alongside real results. They advertise a plausible-looking
+// video/mp4 content type, so they can't be told apart by content type alone
+// and have to be filtered by name explicitly.
 const isControlEntry = (s: Stream) =>
   /comet sync/i.test(s.name ?? '') || /comet sync/i.test(s.title ?? '');
 
-// Both addons tag every TorBox result with its cache state right in `name`
-// — verified live: Torrentio uses "[TB+]" (cached) vs "[TB download]" (not
-// yet on TorBox's servers), Comet uses "[TB⚡]" vs "[TB⬇️]". An uncached one
-// still "resolves" (TorBox queues the torrent and serves a real MP4 in the
-// meantime — the "still downloading" placeholder players show as an actual
-// clip, not an error), so this can't be caught after the fact by checking
-// resolveStream's response. It has to be excluded before it's ever offered
-// as a candidate.
-const isUncachedDebrid = (s: Stream) => /^\[tb[^\]]*(?:download|⬇)/i.test(s.name ?? '');
+// Addons backed by a caching provider tag each result with its cache state
+// directly in `name`, using a short provider prefix plus a marker: a "+"/"⚡"
+// style tag for something already cached and ready, versus a
+// "download"/"⬇️" tag for something that still has to be fetched first.
+//
+// An uncached result is worse than a slow one: it still "resolves"
+// successfully, because the provider queues the download and serves a
+// placeholder clip in the meantime. That placeholder is a real, decodable
+// video, so nothing about the response distinguishes it from the actual
+// content — checking after the fact is hopeless. It has to be excluded
+// before it is ever offered as a playback candidate.
+//
+// The prefixes below cover the common providers; the marker match is what
+// actually decides, so an unrecognised provider simply falls through and is
+// treated as playable rather than being wrongly discarded.
+const isUncachedDebrid = (s: Stream) =>
+  /^\[(tb|rd|ad|pm|dl)[^\]]*(?:download|⬇)/i.test(s.name ?? '');
 
 const RANK = ['2160p', '1080p', '720p', '480p'];
 const byQuality = (a: Stream, b: Stream) => {
   const q = (s: Stream) => RANK.findIndex(r => (s.name ?? s.title ?? '').includes(r));
   const [qa, qb] = [q(a), q(b)];
   if (qa !== qb) return (qa < 0 ? 99 : qa) - (qb < 0 ? 99 : qb);
-  // Playable-now first: .mp4, then anything with a filename, then unknowns.
-  const rank = (s: Stream) => {
-    const f = s.behaviorHints?.filename ?? '';
-    return /\.mp4$/i.test(f) ? 0 : f ? 1 : 2;
-  };
-  return rank(a) - rank(b);
+  // Used to also rank .mp4 first within a resolution tier — MKV seeking was
+  // entirely impossible on this platform at the time, so a container this
+  // pipeline could seek at all was a real "playable now" signal. That
+  // reason no longer holds now that MKV goes through MkvMseSession's
+  // restart-based remux (see streamSelection.ts's walkBuckets for the same
+  // removal at the resolution-ordering stage) — carrying a leftover
+  // container bias here would have silently undone that removal, since this
+  // sort runs upstream of streamSelection.ts and its result order is what
+  // ties get broken by there.
+  return 0;
 };
 
 const MAX_PER_RESOLUTION = 6;
@@ -74,8 +86,8 @@ function resolutionOf(s: Stream): string {
 
 // id is `tt0133093` (movie) or `tt0903747:1:1` (series episode)
 export async function streams(type: MediaType, id: string): Promise<Stream[]> {
-  const { torrentioBase, cometBase } = getSettingsSync();
-  const bases = [torrentioBase, cometBase].filter(Boolean);
+  const { streamAddonUrls } = getSettingsSync();
+  const bases = (streamAddonUrls ?? []).filter(Boolean);
   if (bases.length === 0) return [];
 
   const results = await Promise.allSettled(
@@ -98,7 +110,7 @@ export async function streams(type: MediaType, id: string): Promise<Stream[]> {
     .sort(byQuality);
 
   // Cap per resolution first (so 1080p releases can't crowd out every 2160p
-  // option), then cap the combined total. Comet alone returned 1666 raw
+  // option), then cap the combined total. A single addon alone returned 1666 raw
   // results for one title in testing — this needs to stay small either way.
   const perResolution = new Map<string, Stream[]>();
   for (const s of deduped) {
@@ -165,8 +177,9 @@ async function assertMediaContainer(r: { arrayBuffer: () => Promise<ArrayBuffer>
   throw new Error(hint ? `source is not playable: ${hint}` : 'source is not a media container');
 }
 
-// Resolve at play time, not list time — TorBox's requestdl links open for a
-// limited window, so a URL resolved while browsing can be stale by playback.
+// Resolve at play time, not list time — providers hand out download links
+// that stay valid only for a limited window, so a URL resolved while
+// browsing can already be stale by the time playback actually starts.
 //
 // A 2xx alone is NOT enough to call a source good, which is what the old
 // version assumed. Two failure modes got through it and both looked like
@@ -211,9 +224,9 @@ export async function resolveStream(s: Stream): Promise<{ finalUrl: string; cont
     const seekable = r.status === 206 || Boolean(r.headers.get('content-range')) || /bytes/i.test(r.headers.get('accept-ranges') ?? '');
     if (!seekable) throw new Error('source does not support seeking');
 
-    // Headers alone can't be trusted. TorBox serves plain-text failures like
-    // "failed to split torrent" for links it can't actually deliver, and
-    // they don't reliably arrive with a text content-type — so the player
+    // Headers alone can't be trusted. Providers serve plain-text failure
+    // messages for links they can't actually deliver, and those don't
+    // reliably arrive with a text content-type — so the player
     // accepted the URL and died seconds into playback instead of the walk
     // moving on. The container signature settles it regardless of what the
     // headers claim, and the bytes are already in hand.

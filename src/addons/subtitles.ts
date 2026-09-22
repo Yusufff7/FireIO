@@ -53,10 +53,25 @@ const LANG_NAMES: Record<string, string> = {
   kor: 'Korean', chi: 'Chinese', ara: 'Arabic', hin: 'Hindi', dut: 'Dutch',
   swe: 'Swedish', dan: 'Danish', nor: 'Norwegian', fin: 'Finnish', pol: 'Polish',
   tur: 'Turkish', gre: 'Greek', ell: 'Greek', heb: 'Hebrew', hrv: 'Croatian',
+  // ISO 639-1 (2-letter, BCP-47's base subtag) — a Matroska muxer can tag a
+  // track with either this or the 3-letter table above (see
+  // MkvDemuxCore.cpp's language-reading comment: modern mkvmerge prefers
+  // writing only the BCP-47 LanguageIETF element), so both need a label.
+  en: 'English', es: 'Spanish', fr: 'French', de: 'German', it: 'Italian',
+  pt: 'Portuguese', ru: 'Russian', ja: 'Japanese', ko: 'Korean', zh: 'Chinese',
+  ar: 'Arabic', hi: 'Hindi', nl: 'Dutch', sv: 'Swedish', da: 'Danish',
+  no: 'Norwegian', fi: 'Finnish', pl: 'Polish', tr: 'Turkish', el: 'Greek',
+  he: 'Hebrew', hr: 'Croatian',
 };
 
+// `lang` may carry a region/script subtag ("pt-BR", "zh-Hans") — only the
+// base subtag before the first '-' is what LANG_NAMES keys on; the rest
+// isn't dropped from what's shown, just not translated to a name.
 export function subtitleLangLabel(lang: string): string {
-  return LANG_NAMES[lang] ?? lang.toUpperCase();
+  const base = lang.split(/[-_]/)[0].toLowerCase();
+  const name = LANG_NAMES[base];
+  if (!name) return lang.toUpperCase();
+  return base === lang.toLowerCase() ? name : `${name} (${lang})`;
 }
 
 // One run of cue text with a consistent style — <i>, <b>, <u> are the only

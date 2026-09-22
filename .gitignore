@@ -11,6 +11,25 @@ node_modules
 CMakeUserPresets.json
 npm-debug.log
 
-# Real TorBox API key + addon URLs — see localDefaults.example.ts for the
-# committed template.
+# Your real addon URLs (these embed your provider API key) — see
+# localDefaults.example.ts for the committed template.
 src/storage/localDefaults.ts
+
+# Built app packages. These are NOT merely build noise: localDefaults.ts is
+# compiled into the JS bundle, so your provider API key sits in plaintext
+# inside every bundle (verified) and therefore inside the zstd-compressed
+# .vpkg built from it. `build/` above already covers the staging copies, but
+# packaging drops finished artifacts at the repo root under @amazon-devices/,
+# which nothing here was catching — one `git add .` would have published the
+# key to a public repo.
+*.vpkg
+*.vpack
+@amazon-devices/
+
+# Native module build output. The host-side test harness builds in place, and
+# CMake preset files record absolute paths from whatever machine generated
+# them, so neither belongs in version control.
+MkvDemuxModule/build/
+MkvDemuxModule/test/build*/
+CMakeUserPresets.json
+buildinfo.json

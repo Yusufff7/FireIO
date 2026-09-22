@@ -1,0 +1,22 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 262dc31..42de05b 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -29,8 +29,15 @@ feature_info_on_off(BUILD_TESTING "will build test code" "will build without tes
+ option(DEV_MODE "Developer mode with extra compilation checks" OFF)
+ feature_info_on_off(DEV_MODE "added developer mode extra compilation checks" "default build mode")
+ 
+-find_package(EBML 2.0.0)
+-set_package_properties(EBML PROPERTIES DESCRIPTION "libebml")
++# Vendored in-tree build (StremioVega/MkvDemuxModule): libebml is built via
++# add_subdirectory in the parent CMakeLists, which also defines the
++# EBML::ebml alias this file links against below — so the target already
++# exists and the installed-package lookup isn't needed. Guarded rather than
++# removed so this file stays a clean, mergeable diff against upstream.
++if(NOT TARGET EBML::ebml)
++  find_package(EBML 2.0.0)
++  set_package_properties(EBML PROPERTIES DESCRIPTION "libebml")
++endif()
+ 
+ include(GNUInstallDirs)
+ 

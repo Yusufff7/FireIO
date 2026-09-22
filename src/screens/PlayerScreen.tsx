@@ -15,17 +15,14 @@ import {
   type SrtSegment,
 } from '../addons/subtitles';
 import {
-  LANGUAGE_LABELS,
-  availableLanguages,
   availableResolutions,
-  detectAudioLanguage,
   orderCandidates,
   resolveFirstWorking,
-  type AudioLanguage,
   type ResolveAttempt,
 } from '../addons/streamSelection';
 import { getSkipTimes, type SkipTimes } from '../addons/skipTimes';
 import { MkvMseSession } from '../player/mkvMse';
+import type { MkvDemuxAudioTrack, MkvDemuxSubtitleTrack } from '@amazon-devices/mkvdemuxmodule';
 import { getHistorySync, recordWatched, resumePositionFor, saveProgress } from '../storage/history';
 import {
   DELAY_STEP,
@@ -69,7 +66,7 @@ type SubtitleTrackEntry = {
 
 // Which pane of the track panel is showing. Each gets its own screen so no
 // list has to be truncated to fit beside another.
-type TrackPane = 'main' | 'language' | 'appearance' | 'resolution' | 'sourceLanguage';
+type TrackPane = 'main' | 'language' | 'appearance' | 'resolution' | 'audioTrack';
 
 // What the "next episode" flow carries forward — richer than the bare
 // {id, title} that arrives via route params, since the derived lookup below
@@ -257,7 +254,6 @@ export function PlayerScreen({ route, navigation }: Props) {
     id,
     type,
     isAnime: isAnimeParam,
-    preferredLanguage,
     preferredResolution,
     poster,
     background,
@@ -279,6 +275,9 @@ export function PlayerScreen({ route, navigation }: Props) {
   // ordinary progressive-URL path is active, which is the common case for
   // any source with an MP4 alternative.
   const mseSessionRef = useRef<MkvMseSession | null>(null);
+  // The previous source's native teardown, so the next source's effect run
+  // can wait for it — see its assignment below for why this matters.
+  const teardownRef = useRef<Promise<void>>(Promise.resolve());
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string>();
   const [playing, setPlaying] = useState(false);
@@ -302,6 +301,12 @@ export function PlayerScreen({ route, navigation }: Props) {
   // SAME cue return the SAME segments array, since it's computed once at
   // parse time and stored on the cue.
   const [cueSegments, setCueSegments] = useState<SrtSegment[] | null>(null);
+  // Populated once an MKV's MSE session is ready (see the prepare() effect
+  // below) — empty for a direct-URL source, or an MKV with only one audio
+  // track, both of which mean there's nothing to pick between.
+  const [mseAudioTracks, setMseAudioTracks] = useState<MkvDemuxAudioTrack[]>([]);
+  const [activeAudioTrackNumber, setActiveAudioTrackNumber] = useState<number | undefined>(undefined);
+  const [mseSubtitleTracks, setMseSubtitleTracks] = useState<MkvDemuxSubtitleTrack[]>([]);
 
   // Controls auto-hide, like any real streaming app: visible by default,
   // fades out after idle while playing, comes back on any remote input.
@@ -343,15 +348,13 @@ export function PlayerScreen({ route, navigation }: Props) {
     };
   }, [id, type]);
 
-  // What the Resolution/Audio Language menu picks override to — seeded from
-  // Continue Watching/next-episode's remembered preference where present.
-  const [userLanguage, setUserLanguage] = useState<AudioLanguage | undefined>(preferredLanguage);
+  // What the Resolution menu pick overrides to — seeded from Continue
+  // Watching/next-episode's remembered preference where present.
   const [userResolution, setUserResolution] = useState<string | undefined>(preferredResolution);
   const candidates = useMemo(
-    () => orderCandidates(allStreams, isAnime, { language: userLanguage, resolution: userResolution }),
-    [allStreams, isAnime, userLanguage, userResolution],
+    () => orderCandidates(allStreams, { resolution: userResolution }),
+    [allStreams, userResolution],
   );
-  const langOptions = useMemo(() => availableLanguages(allStreams, isAnime), [allStreams, isAnime]);
   const resOptions = useMemo(() => availableResolutions(allStreams), [allStreams]);
 
   const [resolvedUrl, setResolvedUrl] = useState<string | undefined>(undefined);
@@ -375,6 +378,11 @@ export function PlayerScreen({ route, navigation }: Props) {
     setCurrentTime(0);
     setDuration(0);
     setCueSegments(null);
+    // Embedded audio tracks are per-MKV-instance, unlike external
+    // subtitles — a new source means a new (or no) track list.
+    setMseAudioTracks([]);
+    setActiveAudioTrackNumber(undefined);
+    setMseSubtitleTracks([]);
     // Subtitles are external-only and independent of the video source, so
     // the active pick survives a skip/resolution switch untouched.
   }, []);
@@ -426,32 +434,34 @@ export function PlayerScreen({ route, navigation }: Props) {
     skipRef.current = skipCurrentSource;
   }, [skipCurrentSource]);
 
-  // Resolution/Language menu picks: re-walk from a clean slate with the new
+  // Resolution menu pick: re-walk from a clean slate with the new
   // preference pinned first, same fallback behavior as the initial load.
   const selectResolution = useCallback(
     (res: string) => {
       setUserResolution(res);
-      const list = orderCandidates(allStreams, isAnime, { language: userLanguage, resolution: res });
+      const list = orderCandidates(allStreams, { resolution: res });
       excludedRef.current = new Set();
       resetForNewSource();
       runResolve(list);
       setPane('main');
       setShowTracks(false);
     },
-    [allStreams, isAnime, userLanguage, resetForNewSource, runResolve],
+    [allStreams, resetForNewSource, runResolve],
   );
-  const selectSourceLanguage = useCallback(
-    (lang: AudioLanguage) => {
-      setUserLanguage(lang);
-      const list = orderCandidates(allStreams, isAnime, { language: lang, resolution: userResolution });
-      excludedRef.current = new Set();
-      resetForNewSource();
-      runResolve(list);
-      setPane('main');
-      setShowTracks(false);
-    },
-    [allStreams, isAnime, userResolution, resetForNewSource, runResolve],
-  );
+
+  // Switches the embedded audio track on the CURRENT MKV, in place — unlike
+  // Resolution, this never re-resolves or reloads anything; it's
+  // MkvMseSession.switchAudioTrack doing the work against the already-
+  // playing source.
+  const selectAudioTrack = useCallback((trackNumber: number) => {
+    const mse = mseSessionRef.current;
+    if (!mse) return;
+    mse.switchAudioTrack(trackNumber).then(ok => {
+      if (ok) setActiveAudioTrackNumber(mse.getActiveAudioTrackNumber());
+    });
+    setPane('main');
+    setShowTracks(false);
+  }, []);
 
   // Subtitles come from OpenSubtitles and are keyed to the title, not to the
   // release being played — so they're fetched once here and survive every
@@ -474,11 +484,36 @@ export function PlayerScreen({ route, navigation }: Props) {
     // naturally on every switch.
     let failedOver = false;
     let watchdog: ReturnType<typeof setTimeout> | undefined;
+
+    // Wait for the PREVIOUS source's native player to actually finish
+    // tearing down before touching the pipeline again. React effect
+    // cleanup can't be async, so the previous run's cleanup below only
+    // ever *started* deinitialize() and moved on — this effect used to
+    // construct and initialize a brand new VideoPlayer immediately after,
+    // with no guarantee the old one's teardown had landed yet.
+    //
+    // That race is real, not theoretical: confirmed from a device log
+    // where switching sources produced
+    //   "FrameProcessor__discontinuity_found: Discontinuity found for
+    //    sample at PTS 8382999 DTS 8382999, because last_decode_timestamp
+    //    was 39914000"
+    // on the FIRST sample of the brand new SourceBuffer for the NEW
+    // source — a timestamp from the OLD source's playback bleeding into a
+    // fresh MediaSource that had no way to have seen it, immediately after
+    // the log confirms the new TrackBuffer really was empty
+    // ("TrackBuffer (video) is empty, set need_random_access_point flag").
+    // The only explanation is a shared underlying decoder pipeline
+    // resource whose discontinuity-tracking state hadn't been reset yet
+    // because the old teardown was still in flight — which then stalled
+    // the new source exactly like the seek-path discontinuity bug did.
+    const previousTeardown = teardownRef.current;
+
     const p = new VideoPlayer();
     playerRef.current = p;
     mseSessionRef.current = null;
 
-    p.initialize()
+    previousTeardown
+      .then(() => (cancelled ? undefined : p.initialize()))
       .then(async () => {
         if (cancelled) return;
 
@@ -525,6 +560,9 @@ export function PlayerScreen({ route, navigation }: Props) {
           }
           if (mseReady && !cancelled) {
             mseSessionRef.current = session;
+            setMseAudioTracks(session.getAudioTracks());
+            setActiveAudioTrackNumber(session.getActiveAudioTrackNumber());
+            setMseSubtitleTracks(session.getSubtitleTracks());
           } else {
             session.dispose();
           }
@@ -542,6 +580,18 @@ export function PlayerScreen({ route, navigation }: Props) {
 
         if (cancelled) return;
         setReady(true);
+        // `setReady` is what mounts <KeplerVideoView> below — the native
+        // video surface it wraps doesn't exist until that render actually
+        // commits. Calling play() on the very next line raced ahead of it
+        // often enough to matter: the pipeline would reach for a surface
+        // that wasn't attached yet ("Failed to retrieve default config or
+        // surfaceless is disabled" in the device log), and the OS's own
+        // resource manager then killed the app outright for holding a
+        // media-playback session with no attached foreground display.
+        // One frame is enough for React to commit the mount before play()
+        // reaches native.
+        await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+        if (cancelled) return;
         try {
           await p.play();
           setPlaying(true);
@@ -628,11 +678,10 @@ export function PlayerScreen({ route, navigation }: Props) {
             episodeThumbnail,
             episodeLabel,
             // Remembered so Continue Watching can resume this exact episode,
-            // preferring the same language/resolution bucket without pinning
-            // to this exact release — see types.ts.
+            // preferring the same resolution bucket without pinning to this
+            // exact release — see types.ts.
             episodeId: id,
             isAnime,
-            lastLanguage: resolvedStream ? detectAudioLanguage(resolvedStream, isAnime) : userLanguage,
             lastResolution: resolvedStream ? parseReleaseInfo(resolvedStream).resolution : userResolution,
           }).catch(() => {});
         } catch (e) {
@@ -649,7 +698,10 @@ export function PlayerScreen({ route, navigation }: Props) {
       mseSessionRef.current?.dispose();
       mseSessionRef.current = null;
       playerRef.current?.pause?.();
-      playerRef.current?.deinitialize?.().catch(() => {});
+      // Recorded, not fire-and-forgotten — the NEXT source's effect run
+      // awaits this before touching the pipeline again. See this effect's
+      // own top-of-body comment for why that's required, not optional.
+      teardownRef.current = (playerRef.current?.deinitialize?.() ?? Promise.resolve()).catch(() => {});
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [resolvedUrl]);
@@ -724,9 +776,17 @@ export function PlayerScreen({ route, navigation }: Props) {
   // means "show this later", i.e. compare against a correspondingly earlier
   // playback position. Only sets state when the visible line actually
   // changes, so this ticks often without re-rendering often.
-  const activeCues = subtitleTracks.find(t => t.key === activeSubtitleKey)?.cues;
+  // An embedded track's cues live in MkvMseSession, not in this array (see
+  // its own comment) — they grow as more of the file is fetched, so they're
+  // read fresh every tick below rather than captured once here. An external
+  // (addon) track's cues are static once fetched, so a plain reference is
+  // enough for those.
+  const activeSubtitleIsEmbedded = activeSubtitleKey?.startsWith('embedded:') ?? false;
+  const activeExternalCues = activeSubtitleIsEmbedded
+    ? undefined
+    : subtitleTracks.find(t => t.key === activeSubtitleKey)?.cues;
   useEffect(() => {
-    if (!ready || !activeCues) {
+    if (!ready || (!activeExternalCues && !activeSubtitleIsEmbedded)) {
       setCueSegments(null);
       return;
     }
@@ -734,12 +794,12 @@ export function PlayerScreen({ route, navigation }: Props) {
     // film's track runs to a couple of thousand of them; find() walked the
     // list from the start on every tick, several times a second, for the
     // whole runtime.
-    const findCue = (t: number): SrtCue | undefined => {
+    const findCue = (cues: SrtCue[], t: number): SrtCue | undefined => {
       let lo = 0;
-      let hi = activeCues.length - 1;
+      let hi = cues.length - 1;
       while (lo <= hi) {
         const mid = (lo + hi) >> 1;
-        const c = activeCues[mid];
+        const c = cues[mid];
         if (t < c.start) hi = mid - 1;
         else if (t > c.end) lo = mid + 1;
         else return c;
@@ -750,11 +810,12 @@ export function PlayerScreen({ route, navigation }: Props) {
     const iv = setInterval(() => {
       const p = playerRef.current as any;
       const t = (typeof p?.currentTime === 'number' ? p.currentTime : 0) - delay;
-      const next = findCue(t)?.segments ?? null;
+      const cues = activeSubtitleIsEmbedded ? (mseSessionRef.current?.getEmbeddedSubtitleCues() ?? []) : activeExternalCues!;
+      const next = findCue(cues, t)?.segments ?? null;
       setCueSegments(prev => (prev === next ? prev : next));
     }, CUE_TICK_MS);
     return () => clearInterval(iv);
-  }, [ready, activeCues, delay]);
+  }, [ready, activeExternalCues, activeSubtitleIsEmbedded, delay]);
 
   // Fade + mount/unmount the controls chrome as controlsVisible changes.
   useEffect(() => {
@@ -801,6 +862,10 @@ export function PlayerScreen({ route, navigation }: Props) {
   const seekTargetRef = useRef<number | null>(null);
   const commitTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const settleTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  // Bumped at the start of every commitSeek call — see the comment inside
+  // commitSeek for why a generation check on the write itself (not just
+  // the debounce timer above) turned out to be necessary.
+  const commitGenerationRef = useRef(0);
 
   // Extracted so both the direct-URL and MSE-gated paths in commitSeek below
   // go through the exact same write — see the comments there for why this
@@ -852,28 +917,62 @@ export function PlayerScreen({ route, navigation }: Props) {
     const target = seekTargetRef.current;
     if (target === null) return;
 
-    const writeAndSettle = () => {
-      doCommitWrite(p, target);
+    // The debounce timer in seekTo prevents two commits from being
+    // SCHEDULED at once, but not from being IN FLIGHT at once: once this
+    // function's async body starts (particularly the MSE branch below,
+    // which can spend real time fetching over the network), a fresh press
+    // can trigger a whole new commitSeek before this one's write ever
+    // happens. Without this generation check, both writes reached
+    // native — confirmed on-device as two overlapping seekWithRate calls,
+    // the second stomping the first mid-flight and leaving playback stuck
+    // rather than landing on either target. Capturing the generation here
+    // and checking it in writeAndSettle means only the LAST commitSeek to
+    // start ever actually writes currentTime.
+    const myGeneration = ++commitGenerationRef.current;
+
+    const writeAndSettle = (writeTarget: number) => {
+      if (commitGenerationRef.current !== myGeneration) return;
+      doCommitWrite(p, writeTarget);
       if (settleTimerRef.current) clearTimeout(settleTimerRef.current);
       settleTimerRef.current = setTimeout(() => {
         seekTargetRef.current = null;
       }, SEEK_SETTLE_MS);
     };
 
-    // MSE-backed sources need the SourceBuffer to actually have data
-    // covering the target before the write below means anything — the
-    // native pipeline only ever plays whatever we've already appended, it
-    // never fetches or seeks the raw URL itself. Direct-URL sources (the
-    // common case) skip straight to the same bare write as always.
+    // MSE-backed sources can't be seeked in the ordinary sense: the
+    // remuxed fragments carry no absolute timestamps, so the player's
+    // timeline is just "everything appended so far, in order" and asking
+    // it to jump within that means nothing. restartAt rebuilds the stream
+    // at the target position instead and reports the media time it
+    // actually landed on (the nearest Cluster boundary), which is what
+    // gets written below. Direct-URL sources seek natively and skip
+    // straight to the same bare write as always.
     const mse = mseSessionRef.current;
     if (mse) {
       mse
-        .prepareForSeek(target)
-        .catch(e => console.warn('MkvMseSession: seek prep failed, writing anyway —', e))
-        .finally(writeAndSettle);
+        .restartAt(target)
+        .catch(e => {
+          console.warn('MkvMseSession: seek restart threw, not writing —', e);
+          return null;
+        })
+        .then(landed => {
+          if (landed !== null) {
+            writeAndSettle(landed);
+            return;
+          }
+          // Couldn't reposition. Deliberately does NOT write anyway: a
+          // currentTime with nothing buffered near it makes every future
+          // "how much is buffered ahead" check read as "basically none",
+          // so the forward loop fetches without limit trying to close a
+          // gap it can never close — confirmed on-device as unbounded
+          // buffer growth that eventually crashed the app from memory
+          // exhaustion, on that source and the next one both. Leaving
+          // currentTime alone means playback simply continues.
+          if (commitGenerationRef.current === myGeneration) seekTargetRef.current = null;
+        });
       return;
     }
-    writeAndSettle();
+    writeAndSettle(target);
   }, []);
 
   // Absolute seek. Every seek in the screen funnels through here so they all
@@ -1018,19 +1117,67 @@ export function PlayerScreen({ route, navigation }: Props) {
     return () => sub.remove();
   }, [navigation, showTracks, pane, controlsVisible, error, resolveFailed, ready]);
 
-  const allSubtitles = subtitleTracks;
+  // Embedded tracks carry no `cues` here — extraction is live inside
+  // MkvMseSession (see its own comment on why), read fresh every overlay
+  // tick below rather than stored in this array.
+  const embeddedSubtitleEntries = useMemo<SubtitleTrackEntry[]>(
+    () =>
+      mseSubtitleTracks.map(t => ({
+        key: `embedded:${t.trackNumber}`,
+        lang: t.language,
+        label: t.name || subtitleLangLabel(t.language),
+        cues: [] as SrtCue[],
+      })),
+    [mseSubtitleTracks],
+  );
+  const externalSubtitleEntries = subtitleTracks;
+  const allSubtitles = useMemo<SubtitleTrackEntry[]>(
+    () => [...embeddedSubtitleEntries, ...externalSubtitleEntries],
+    [embeddedSubtitleEntries, externalSubtitleEntries],
+  );
+
+  // Shared row renderer for both the Embedded and OpenSubtitles groups in
+  // the Language pane — same look, same "only show the release name when
+  // it's actually disambiguating something" rule, just grouped under
+  // different subheaders above.
+  const renderSubtitleRow = (entry: SubtitleTrackEntry) => {
+    const ambiguous = allSubtitles.filter(e => e.label === entry.label).length > 1;
+    return (
+      <MenuRow key={entry.key} onPress={() => selectSubtitle(entry.key)}>
+        <Text style={[styles.trackRowText, activeSubtitleKey === entry.key && styles.trackRowActive]}>
+          {activeSubtitleKey === entry.key ? '✓  ' : '    '}
+          {entry.label}
+        </Text>
+        {ambiguous && entry.variant ? (
+          <Text style={styles.trackRowVariant} numberOfLines={1}>
+            {'    '}
+            {entry.variant}
+          </Text>
+        ) : null}
+      </MenuRow>
+    );
+  };
 
   const selectSubtitle = (key: string | null) => {
     setCueSegments(null);
 
     if (key === null) {
       setActiveSubtitleKey(null);
+      mseSessionRef.current?.selectEmbeddedSubtitleTrack(null, false);
       saveSubtitleLang(id, null).catch(() => {});
       return;
     }
 
     const entry = allSubtitles.find(e => e.key === key);
     if (!entry) return;
+
+    if (key.startsWith('embedded:')) {
+      const trackNumber = Number(key.slice('embedded:'.length));
+      const track = mseSubtitleTracks.find(t => t.trackNumber === trackNumber);
+      mseSessionRef.current?.selectEmbeddedSubtitleTrack(trackNumber, track?.codecId !== 'S_TEXT/UTF8');
+    } else {
+      mseSessionRef.current?.selectEmbeddedSubtitleTrack(null, false);
+    }
 
     setActiveSubtitleKey(key);
     saveSubtitleLang(id, entry.lang || null).catch(() => {});
@@ -1095,17 +1242,16 @@ export function PlayerScreen({ route, navigation }: Props) {
     };
   }, [nextEpisode, id, type]);
 
-  // Continue into the next episode by resolution/audio preference, not exact
+  // Continue into the next episode by resolution preference, not exact
   // source — replaces the screen with a fresh Player for that episode,
-  // carrying forward whatever language/resolution is currently playing (or
-  // was preferred) so it stays roughly the same, with the normal fallback
-  // walk behind it if that combination isn't available for this episode.
+  // carrying forward whatever resolution is currently playing (or was
+  // preferred) so it stays roughly the same, with the normal fallback walk
+  // behind it if that resolution isn't available for this episode.
   // Deliberately synchronous: the resolve — and its own progress UI — happens
   // on the newly-mounted screen, not here.
   const goToNextEpisode = useCallback(() => {
     const target = derivedNext;
     if (!target) return;
-    const lang = resolvedStream ? detectAudioLanguage(resolvedStream, isAnime) : userLanguage;
     const res = resolvedStream ? parseReleaseInfo(resolvedStream).resolution : userResolution;
     navigation.replace('Player', {
       id: target.id,
@@ -1114,12 +1260,11 @@ export function PlayerScreen({ route, navigation }: Props) {
       poster,
       background,
       isAnime,
-      preferredLanguage: lang,
       preferredResolution: res,
       episodeThumbnail: target.thumbnail,
       episodeLabel: target.episodeLabel,
     });
-  }, [derivedNext, resolvedStream, isAnime, userLanguage, userResolution, navigation, type, poster, background]);
+  }, [derivedNext, resolvedStream, isAnime, userResolution, navigation, type, poster, background]);
 
   // Opening/ending timestamps for this episode, when they exist. Attempted
   // for EVERY series rather than gated on the Animation genre: that genre
@@ -1218,8 +1363,11 @@ export function PlayerScreen({ route, navigation }: Props) {
   const activeSubtitleLabel = allSubtitles.find(e => e.key === activeSubtitleKey)?.label ?? 'Off';
   const formatDelay = (d: number) => `${d > 0 ? '+' : ''}${d.toFixed(2)}s`;
 
-  const currentSourceLanguage = resolvedStream ? detectAudioLanguage(resolvedStream, isAnime) : userLanguage;
-  const currentLangLabel = currentSourceLanguage ? LANGUAGE_LABELS[currentSourceLanguage] : '—';
+  const hasAudioTrackChoice = mseAudioTracks.length > 1;
+  const activeAudioTrack = mseAudioTracks.find(t => t.trackNumber === activeAudioTrackNumber);
+  const currentAudioTrackLabel = activeAudioTrack
+    ? activeAudioTrack.name || subtitleLangLabel(activeAudioTrack.language)
+    : '—';
   const currentResLabel = resolvedStream ? parseReleaseInfo(resolvedStream).resolution ?? '—' : userResolution ?? '—';
   const displayReleaseLabel =
     releaseLabel ??
@@ -1442,6 +1590,20 @@ export function PlayerScreen({ route, navigation }: Props) {
                       </MenuRow>
                     )}
 
+                    {hasAudioTrackChoice && (
+                      <>
+                        <Text style={[styles.trackPanelHeading, { marginTop: spacing.lg }]}>Audio</Text>
+                        <MenuRow onPress={() => setPane('audioTrack')}>
+                          <View style={styles.trackRowSplit}>
+                            <Text style={styles.trackRowText}>Audio Track</Text>
+                            <Text style={styles.trackRowValue} numberOfLines={1}>
+                              {currentAudioTrackLabel}  ›
+                            </Text>
+                          </View>
+                        </MenuRow>
+                      </>
+                    )}
+
                     <Text style={[styles.trackPanelHeading, { marginTop: spacing.lg }]}>Source</Text>
                     {!hasSourceChoice ? (
                       <ActivityIndicator color={colors.text} style={{ marginBottom: spacing.sm }} />
@@ -1452,14 +1614,6 @@ export function PlayerScreen({ route, navigation }: Props) {
                             <Text style={styles.trackRowText}>Resolution</Text>
                             <Text style={styles.trackRowValue} numberOfLines={1}>
                               {currentResLabel}  ›
-                            </Text>
-                          </View>
-                        </MenuRow>
-                        <MenuRow onPress={() => setPane('sourceLanguage')}>
-                          <View style={styles.trackRowSplit}>
-                            <Text style={styles.trackRowText}>Audio Language</Text>
-                            <Text style={styles.trackRowValue} numberOfLines={1}>
-                              {currentLangLabel}  ›
                             </Text>
                           </View>
                         </MenuRow>
@@ -1489,25 +1643,22 @@ export function PlayerScreen({ route, navigation }: Props) {
                         {activeSubtitleKey === null ? '✓  ' : '    '}Off
                       </Text>
                     </MenuRow>
-                    {allSubtitles.map(entry => {
-                      // The release name only earns its space when it's
-                      // actually disambiguating something.
-                      const ambiguous = allSubtitles.filter(e => e.label === entry.label).length > 1;
-                      return (
-                        <MenuRow key={entry.key} onPress={() => selectSubtitle(entry.key)}>
-                          <Text style={[styles.trackRowText, activeSubtitleKey === entry.key && styles.trackRowActive]}>
-                            {activeSubtitleKey === entry.key ? '✓  ' : '    '}
-                            {entry.label}
-                          </Text>
-                          {ambiguous && entry.variant ? (
-                            <Text style={styles.trackRowVariant} numberOfLines={1}>
-                              {'    '}
-                              {entry.variant}
-                            </Text>
-                          ) : null}
-                        </MenuRow>
-                      );
-                    })}
+
+                    {/* Embedded (in the MKV itself) first, then external
+                        (OpenSubtitles) — embedded is the release's own
+                        subtitle, worth surfacing before a third-party fetch. */}
+                    {embeddedSubtitleEntries.length > 0 && (
+                      <>
+                        <Text style={[styles.trackPanelHeading, { marginTop: spacing.md }]}>Embedded</Text>
+                        {embeddedSubtitleEntries.map(entry => renderSubtitleRow(entry))}
+                      </>
+                    )}
+                    {externalSubtitleEntries.length > 0 && (
+                      <>
+                        <Text style={[styles.trackPanelHeading, { marginTop: spacing.md }]}>OpenSubtitles</Text>
+                        {externalSubtitleEntries.map(entry => renderSubtitleRow(entry))}
+                      </>
+                    )}
                   </ScrollView>
                 )}
 
@@ -1557,20 +1708,37 @@ export function PlayerScreen({ route, navigation }: Props) {
                   </ScrollView>
                 )}
 
-                {pane === 'sourceLanguage' && (
+                {pane === 'audioTrack' && (
                   <ScrollView showsVerticalScrollIndicator={false}>
                     <MenuRow hasTVPreferredFocus onPress={() => setPane('main')}>
-                      <Text style={styles.trackRowText}>‹  Source</Text>
+                      <Text style={styles.trackRowText}>‹  Audio</Text>
                     </MenuRow>
-                    <Text style={[styles.trackPanelHeading, { marginTop: spacing.sm }]}>Audio Language</Text>
-                    {langOptions.map(lang => (
-                      <MenuRow key={lang} onPress={() => selectSourceLanguage(lang)}>
-                        <Text style={[styles.trackRowText, currentSourceLanguage === lang && styles.trackRowActive]}>
-                          {currentSourceLanguage === lang ? '✓  ' : '    '}
-                          {LANGUAGE_LABELS[lang]}
-                        </Text>
-                      </MenuRow>
-                    ))}
+                    <Text style={[styles.trackPanelHeading, { marginTop: spacing.sm }]}>Audio Track</Text>
+                    {mseAudioTracks.map(track => {
+                      const label = track.name || subtitleLangLabel(track.language);
+                      // The language only earns its own line when the name
+                      // isn't already the language itself — a plain,
+                      // unnamed track just shows the language once.
+                      const showLangLine = Boolean(track.name) && track.language !== 'und';
+                      return (
+                        <MenuRow key={track.trackNumber} onPress={() => selectAudioTrack(track.trackNumber)}>
+                          <Text
+                            style={[
+                              styles.trackRowText,
+                              track.trackNumber === activeAudioTrackNumber && styles.trackRowActive,
+                            ]}>
+                            {track.trackNumber === activeAudioTrackNumber ? '✓  ' : '    '}
+                            {label}
+                          </Text>
+                          {showLangLine && (
+                            <Text style={styles.trackRowVariant} numberOfLines={1}>
+                              {'    '}
+                              {subtitleLangLabel(track.language)} · {track.channels}ch
+                            </Text>
+                          )}
+                        </MenuRow>
+                      );
+                    })}
                   </ScrollView>
                 )}
               </View>

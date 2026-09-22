@@ -3,7 +3,7 @@ schema-version = 1
 [package]
 title = "FireIO"
 version = "0.1.0"
-build_number = 1
+build_number = 47
 id = "com.yusuf.stremiovega"
 # Must be the '@image/<file>' form, resolved against assets/image/ — vpt
 # rejects any other shape. The package id deliberately stays as-is: changing
