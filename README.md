@@ -233,4 +233,4 @@ This is an active work in progress, and the MKV pipeline in particular is not fi
 
 MIT — see [LICENSE](LICENSE).
 
-This is a personal project and is not affiliated with Stremio or Amazon. It ships no content and no addon configuration; you supply your own addon URLs.
+This is a personal project and is not affiliated with Stremio, Amazon, or any other company. It ships no content and no addon configuration; you supply your own addon URLs.
