@@ -132,7 +132,12 @@ function safeHost(url: string): string {
   return m ? m[1] : url;
 }
 
-// Throws unless the opening bytes carry a recognised container signature.
+export type SniffedContainer = 'mkv' | 'mp4' | 'other';
+
+// Throws unless the opening bytes carry a recognised container signature;
+// otherwise returns which container it is. 'mkv' covers WebM too (same EBML
+// header) — the MKV playback path checks codecs itself and falls back if
+// they're not ones it handles.
 //
 // Deliberately a whitelist, not a blacklist of error strings: a debrid
 // service can word its failures however it likes ("failed to split torrent",
@@ -140,14 +145,14 @@ function safeHost(url: string): string {
 // would always be one new message behind. What every WORKING source has in
 // common is a container magic number in its first bytes, so that is what
 // gets checked.
-async function assertMediaContainer(r: { arrayBuffer: () => Promise<ArrayBuffer> }): Promise<void> {
+async function assertMediaContainer(r: { arrayBuffer: () => Promise<ArrayBuffer> }): Promise<SniffedContainer | undefined> {
   let head: Uint8Array;
   try {
     head = new Uint8Array(await r.arrayBuffer());
   } catch {
     // Can't read the body — don't reject on that alone, since a failure to
     // buffer here says nothing about whether the source is playable.
-    return;
+    return undefined;
   }
   if (head.length < 12) throw new Error('source returned no data');
 
@@ -164,7 +169,9 @@ async function assertMediaContainer(r: { arrayBuffer: () => Promise<ArrayBuffer>
   const isFlv = ascii(0, 'FLV');
   const isOgg = ascii(0, 'OggS');
 
-  if (isMatroska || isMp4 || isRiff || isMpegTs || isMpegPs || isFlv || isOgg) return;
+  if (isMatroska) return 'mkv';
+  if (isMp4) return 'mp4';
+  if (isRiff || isMpegTs || isMpegPs || isFlv || isOgg) return 'other';
 
   // Not a container. Surface a little of what came back instead, so the
   // "trying source" progress line says something useful.
@@ -203,7 +210,9 @@ async function assertMediaContainer(r: { arrayBuffer: () => Promise<ArrayBuffer>
 // just leaves the user staring at "Trying source…".
 const RESOLVE_TIMEOUT_MS = 10000;
 
-export async function resolveStream(s: Stream): Promise<{ finalUrl: string; contentType?: string }> {
+export async function resolveStream(
+  s: Stream,
+): Promise<{ finalUrl: string; contentType?: string; container?: SniffedContainer }> {
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(), RESOLVE_TIMEOUT_MS);
   try {
@@ -230,9 +239,16 @@ export async function resolveStream(s: Stream): Promise<{ finalUrl: string; cont
     // accepted the URL and died seconds into playback instead of the walk
     // moving on. The container signature settles it regardless of what the
     // headers claim, and the bytes are already in hand.
-    await assertMediaContainer(r);
+    //
+    // The sniffed container is also returned, because it's the only reliable
+    // way to know a source is MKV: the addon-supplied filename is often
+    // missing (season packs, some addons), and an MKV that isn't recognised
+    // as one gets handed to the native player instead of the remux path —
+    // which fails outright on the large font attachments common in anime
+    // releases ("reading large block of size 53940377 not supported").
+    const container = await assertMediaContainer(r);
 
-    return { finalUrl: r.url, contentType };
+    return { finalUrl: r.url, contentType, container };
   } finally {
     clearTimeout(t);
   }

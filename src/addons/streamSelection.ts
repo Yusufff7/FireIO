@@ -1,5 +1,5 @@
 import type { Stream } from '../types';
-import { parseReleaseInfo, resolveStream } from './client';
+import { parseReleaseInfo, resolveStream, type SniffedContainer } from './client';
 
 // Not "highest resolution" — 1080p is the real default, with 720p/480p as
 // lighter fallbacks.
@@ -93,16 +93,20 @@ export type ResolveAttempt = { label: string; failed: boolean };
 export async function resolveFirstWorking(
   candidates: Stream[],
   onAttempt: (attempt: ResolveAttempt) => void,
-): Promise<{ stream: Stream; finalUrl: string } | null> {
+): Promise<{ stream: Stream; finalUrl: string; container?: SniffedContainer } | null> {
   for (const s of candidates) {
     const label = s.behaviorHints?.filename || s.title || s.name || 'Unnamed release';
     onAttempt({ label, failed: false });
     try {
-      const { finalUrl } = await resolveStream(s);
-      if (finalUrl) return { stream: s, finalUrl };
-    } catch {
-      // fall through — reported as a failed attempt below, then the next
-      // candidate gets its turn.
+      const { finalUrl, container } = await resolveStream(s);
+      if (finalUrl) return { stream: s, finalUrl, container };
+    } catch (e) {
+      // Reported as a failed attempt below, then the next candidate gets its
+      // turn. Logged at WARN (the device throttles INFO) with the reason, so
+      // a skipped source can actually be diagnosed afterwards — the label
+      // is the release name, never the URL, which carries access tokens.
+      const reason = (e as { name?: string })?.name === 'AbortError' ? 'timed out' : String((e as Error)?.message ?? e);
+      console.warn(`resolve: skipped "${label.replace(/\s+/g, ' ').slice(0, 120)}" — ${reason.slice(0, 160)}`);
     }
     onAttempt({ label, failed: true });
   }

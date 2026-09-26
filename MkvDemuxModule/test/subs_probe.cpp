@@ -2,7 +2,9 @@
 // subtitle tracks, then extracts cues from the whole file for the given
 // track (or the first one found).
 //
-// Usage: subs_probe <file.mkv> [trackNumber]
+// Usage: subs_probe <file.mkv> [trackNumber | all]
+//   "all" exercises the multi-track mode (every subtitle track in one pass,
+//   raw text tagged with its track number) that mkvMse.ts uses on-device.
 #include "MkvDemuxCore.h"
 
 #include <cstdio>
@@ -32,6 +34,19 @@ int main(int argc, char** argv) {
 
   const std::string initJson = MkvDemuxCore::parseInitSegment(whole.data(), whole.size());
   std::printf("init: %.*s...\n\n", 300, initJson.c_str());
+
+  if (argc > 2 && std::string(argv[2]) == "all") {
+    uint64_t mask = 0;
+    const size_t subsPos = initJson.find("\"subtitleTracks\":[");
+    for (size_t p = initJson.find("\"trackNumber\":", subsPos); subsPos != std::string::npos && p != std::string::npos;
+         p = initJson.find("\"trackNumber\":", p + 1)) {
+      const long tn = std::atol(initJson.c_str() + p + 14);
+      if (tn > 0 && tn < 64) mask |= uint64_t{1} << tn;
+    }
+    std::printf("extracting all subtitle tracks, mask=0x%llx\n\n", static_cast<unsigned long long>(mask));
+    std::printf("%s\n", MkvDemuxCore::extractTextCuesForTracks(whole.data(), whole.size(), mask, false, true).c_str());
+    return 0;
+  }
 
   long trackNumber = argc > 2 ? std::atol(argv[2]) : -1;
   if (trackNumber < 0) {

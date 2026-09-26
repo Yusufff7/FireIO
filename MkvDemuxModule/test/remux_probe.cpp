@@ -127,7 +127,8 @@ int main(int argc, char** argv) {
 
   int audioSession = -1;
   const bool audioMaybeRemuxable = audioCodecId == "A_AAC" || audioCodecId.rfind("A_AAC/", 0) == 0 ||
-      audioCodecId.rfind("A_AC3", 0) == 0 || audioCodecId == "A_EAC3" || audioCodecId == "A_FLAC" || audioCodecId == "A_OPUS";
+      audioCodecId.rfind("A_AC3", 0) == 0 || audioCodecId == "A_EAC3" || audioCodecId == "A_FLAC" || audioCodecId == "A_OPUS" ||
+      audioCodecId == "A_TRUEHD";
   if (audioMaybeRemuxable) {
     audioSession = MkvDemuxCore::openRemuxSession(audioCodecId, audioCodecPrivate.data(), audioCodecPrivate.size(),
         static_cast<uint64_t>(audioTrackNumber), static_cast<uint32_t>(audioSampleRate),

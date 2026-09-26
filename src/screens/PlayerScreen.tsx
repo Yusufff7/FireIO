@@ -4,7 +4,7 @@ import { VideoPlayer, KeplerVideoView } from '@amazon-devices/react-native-w3cme
 import { TVFocusGuideView, useTVEventHandler } from '@amazon-devices/react-native-kepler';
 import { Focusable } from '../components/Focusable';
 import { IconChevronLeft, IconSubtitles } from '../components/PlayerIcons';
-import { streams as fetchStreams, meta as fetchMeta, parseReleaseInfo } from '../addons/client';
+import { streams as fetchStreams, meta as fetchMeta, parseReleaseInfo, type SniffedContainer } from '../addons/client';
 import {
   fetchSrtCues,
   fetchSubtitles,
@@ -359,6 +359,8 @@ export function PlayerScreen({ route, navigation }: Props) {
 
   const [resolvedUrl, setResolvedUrl] = useState<string | undefined>(undefined);
   const [resolvedStream, setResolvedStream] = useState<Stream | undefined>(undefined);
+  // What the source's opening bytes say it is — see resolveStream.
+  const [resolvedContainer, setResolvedContainer] = useState<SniffedContainer | undefined>(undefined);
   const [resolveFailed, setResolveFailed] = useState(false);
   const [attempt, setAttempt] = useState<ResolveAttempt | null>(null);
   // Streams already tried this "session" — carries across a skip so the walk
@@ -401,6 +403,7 @@ export function PlayerScreen({ route, navigation }: Props) {
     }
     excludedRef.current.add(result.stream);
     setResolvedStream(result.stream);
+    setResolvedContainer(result.container);
     setResolvedUrl(result.finalUrl);
   }, []);
 
@@ -545,7 +548,15 @@ export function PlayerScreen({ route, navigation }: Props) {
         // to the exact same direct-URL `.src` assignment used for
         // everything else — MSE is strictly additive, never a hard
         // dependency for playback to start.
-        const isMkv = resolvedStream ? parseReleaseInfo(resolvedStream).container === 'MKV' : false;
+        // The sniffed container decides, not the filename: addons often don't
+        // supply one, and an unrecognised MKV sent to the native player fails
+        // on large font attachments. Filename is only the fallback for when
+        // the probe couldn't read the body.
+        const isMkv =
+          resolvedContainer === 'mkv' ||
+          (resolvedContainer === undefined && resolvedStream
+            ? parseReleaseInfo(resolvedStream).container === 'MKV'
+            : false);
         let mseReady = false;
         if (isMkv) {
           const session = new MkvMseSession(resolvedUrl);

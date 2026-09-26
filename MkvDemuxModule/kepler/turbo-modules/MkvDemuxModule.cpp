@@ -47,6 +47,14 @@ void MkvDemuxModule::closeRemuxSession(double sessionId) {
 }
 
 std::string MkvDemuxModule::extractTextCues(ArrayBuffer chunk, double trackNumber, bool isAss) {
+  // A negative trackNumber is a bitmask of tracks (bit N = track N), for
+  // harvesting every text subtitle track in one pass — see mkvMse.ts's
+  // extractEmbeddedCues. Encoded into the existing parameter rather than a
+  // new method so the generated TurboModule spec doesn't change.
+  if (trackNumber < 0) {
+    return MkvDemuxCore::extractTextCuesForTracks(
+        chunk.data(), chunk.size(), static_cast<uint64_t>(-trackNumber), isAss, true);
+  }
   return MkvDemuxCore::extractTextCues(chunk.data(), chunk.size(), static_cast<uint64_t>(trackNumber), isAss);
 }
 

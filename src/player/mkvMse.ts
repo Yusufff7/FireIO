@@ -51,8 +51,8 @@ const FORWARD_LOOP_INTERVAL_MS = 500;
 // have the loop backing off forever instead of settling into a steady,
 // bounded polling cadence.
 const FORWARD_LOOP_MAX_STALL_INTERVAL_MS = 8000;
-// How many consecutive 'stalled' windows the forward loop retries before
-// giving up for good. A single stall is routinely transient — a slow range
+// How many consecutive 'stalled' windows the forward loop retries with a
+// growing back-off before settling into slow polling at the ceiling. A single stall is routinely transient — a slow range
 // request, a window that happened to land on no complete Cluster, a hiccup
 // right after a seek — and used to kill the loop permanently on the very
 // first one (see startForwardLoop); this many in a row is what actually
@@ -67,30 +67,85 @@ const MAX_CONSECUTIVE_STALLS = 10;
 function isRemuxableVideoCodecId(codecId: string): boolean {
   return codecId === 'V_MPEG4/ISO/AVC' || codecId === 'V_MPEGH/ISO/HEVC';
 }
-function isRemuxableAudioCodecId(codecId: string): boolean {
-  return (
-    codecId === 'A_AAC' ||
-    codecId.startsWith('A_AAC/') ||
-    codecId.startsWith('A_AC3') ||
-    codecId === 'A_EAC3' ||
-    codecId === 'A_FLAC' ||
-    codecId === 'A_OPUS'
-  );
+// Candidate RFC 6381 codec strings for each remuxable Matroska audio
+// CodecID, in preference order; an empty list means the native remuxer
+// can't handle that codec at all. There's more than one per codec because
+// isTypeSupported isn't just a table lookup: after the static
+// MimeTypeRegistry check (which accepts every string here, case-
+// insensitively) it asks the platform decoder-capability query
+// (isCodecSupportedByPlatform), whose own spelling rules aren't documented.
+// Trying the registry's alternate spelling costs one extra call and means an
+// unrecognised spelling can't silently drop a whole track's audio.
+function audioCodecCandidates(codecId: string): string[] {
+  // AAC-LC: the exact profile can't be told from the CodecID alone, and the
+  // registry only lists fully-qualified "mp4a.40.x" strings, never bare "aac".
+  if (codecId === 'A_AAC' || codecId.startsWith('A_AAC/')) return ['mp4a.40.2'];
+  if (codecId.startsWith('A_AC3')) return ['ac-3', 'mp4a.a5'];
+  if (codecId === 'A_EAC3') return ['ec-3', 'mp4a.a6'];
+  if (codecId === 'A_FLAC') return ['flac', 'fLaC'];
+  if (codecId === 'A_OPUS') return ['opus', 'Opus'];
+  // TrueHD's MP4 sample entry — listed by the platform's MP4 audio table.
+  // Whether this device can DECODE it (rather than only pass it through
+  // over HDMI) is down to the capability query; if it says no, the track is
+  // simply unplayable here and prepare() falls back to direct-URL playback.
+  if (codecId === 'A_TRUEHD') return ['mlpa'];
+  return [];
 }
 
-// MkvDemuxCore's videoCodecFamily()/audioCodecFamily() emit bare MSE codec
-// family tags ("hev1", "aac", ...) with no RFC 6381 profile/level suffix.
-// The platform's SourceBuffer codec check (MimeTypeRegistry.checkSupportedType,
-// read directly from node_modules) does a prefix match for video codecs — a
-// bare tag matches fine — but an EXACT match for audio codecs, and its AAC
-// table only lists fully-qualified "mp4a.40.x" strings, never bare "aac".
+// Memoized: each isTypeSupported call is a synchronous native capability
+// query, and the Audio menu asks about every track on every render.
+const supportedAudioMimeCache = new Map<string, string | null>();
+function supportedAudioMime(codecId: string): string | null {
+  const cached = supportedAudioMimeCache.get(codecId);
+  if (cached !== undefined) return cached;
+  let found: string | null = null;
+  for (const codec of audioCodecCandidates(codecId)) {
+    const mime = `audio/mp4; codecs="${codec}"`;
+    if (MediaSource.isTypeSupported(mime)) {
+      found = mime;
+      break;
+    }
+  }
+  supportedAudioMimeCache.set(codecId, found);
+  return found;
+}
+
+// ASS/SSA Block payloads are "ReadOrder,Layer,Style,Name,MarginL,MarginR,
+// MarginV,Effect,Text" — keep the Text field (everything after the 8th
+// comma, since Text itself may contain commas), drop {override} blocks, and
+// turn \N / \n breaks into real newlines. Mirrors MkvDemuxCore.cpp's
+// extractAssDialogueText; done here because cues for every track now come
+// back from one native call as raw payloads (see extractEmbeddedCues).
+function assDialogueText(payload: string): string {
+  let i = 0;
+  let commas = 0;
+  for (; i < payload.length && commas < 8; i++) {
+    if (payload[i] === ',') commas++;
+  }
+  const text = commas === 8 ? payload.slice(i) : payload;
+  return text.replace(/\{[^}]*\}/g, '').replace(/\\[Nn]/g, '\n');
+}
+
+function describeRanges(sb: SourceBuffer | null): string {
+  if (!sb) return '-';
+  try {
+    const b = sb.buffered;
+    const parts: string[] = [];
+    for (let i = 0; i < b.length; i++) parts.push(`${b.start(i).toFixed(1)}-${b.end(i).toFixed(1)}`);
+    return parts.length ? parts.join(',') : 'empty';
+  } catch {
+    return '?';
+  }
+}
+
+// MkvDemuxCore's videoCodecFamily() emits bare MSE codec family tags
+// ("hev1", "avc1") with no RFC 6381 profile/level suffix. The platform's
+// SourceBuffer codec check (MimeTypeRegistry.checkSupportedType, read
+// directly from node_modules) does a prefix match for video codecs, so a
+// bare tag matches fine. Audio is an EXACT match instead, hence
+// audioCodecCandidates above working from the CodecID.
 function videoCodecsParam(family: string): string | null {
   return family === 'avc1' || family === 'hev1' ? family : null;
-}
-function audioCodecsParam(family: string): string | null {
-  if (family === 'aac') return 'mp4a.40.2'; // AAC-LC — can't tell the exact profile from the CodecID alone; the common case.
-  if (family === 'ac-3' || family === 'ec-3' || family === 'flac' || family === 'opus') return family; // no profile suffix needed — bare tag is the whole RFC 6381 string
-  return null;
 }
 
 // Derived rather than referencing the `AbortSignal` type name directly —
@@ -172,13 +227,35 @@ export class MkvMseSession {
   // already pulling down for video/audio — zero extra network cost, at the
   // price of only ever having cues for territory that's actually been
   // fetched (same tradeoff the seek Cluster index already makes).
-  private subtitleSourceTrackNumber: number | undefined;
-  private subtitleIsAss = false;
-  private embeddedCues: SrtCue[] = [];
+  //
+  // Cues are harvested for EVERY text subtitle track on every window, not
+  // just the selected one. Extracting only the selected track (as an
+  // earlier version did) meant picking a track mid-playback showed nothing
+  // for a minute or more: the forward loop keeps ~60s buffered ahead, so all
+  // of that territory had already been fetched — and its cues skipped —
+  // before the selection was made. On-device that read as "I select the
+  // embedded subtitles and they never show up".
+  private activeSubtitleTrack: number | undefined;
+  private subtitleTrackIsAss = new Map<number, boolean>();
+  // Bitmask of text subtitle track numbers (bit N = track N), passed to
+  // native negated — see MkvDemuxModule.cpp's extractTextCues. Kept as a
+  // plain number rather than built with bitwise ops, which truncate to 32
+  // bits in JS; tracks up to 52 fit exactly in a double.
+  private subtitleTrackMask = 0;
+  private cuesByTrack = new Map<number, SrtCue[]>();
   // De-dupes cues across windows whose byte ranges happen to overlap (a
   // seek's landing window can re-cover a few bytes of already-fetched
   // territory) — start+text is a cheap, good-enough identity for a cue.
-  private embeddedCueKeys = new Set<string>();
+  private cueKeysByTrack = new Map<number, Set<string>>();
+
+  // Which audio track the audio session plays — chosen in prepare() as the
+  // file's default track if this platform can decode it, otherwise the
+  // first one it can (see pickAudioTrack).
+  private audioTrack: MkvDemuxAudioTrack | undefined;
+  // Diagnostics only — surfaced by logDiagnostics.
+  private audioAppendCount = 0;
+  private audioAppendBytes = 0;
+  private lastDiagnosticsAt = 0;
 
   private fileSize: number | undefined;
   private initSegmentEnd = 0;
@@ -212,6 +289,9 @@ export class MkvMseSession {
   // Consecutive 'stalled' outcomes from fetchAndAppendNext, reset to 0 by
   // any 'appended' window — see startForwardLoop's stall handling.
   private consecutiveStalls = 0;
+  // Set once the forward loop has fetched the last byte of the file (and
+  // called endOfStream); cleared by any seek — see startForwardLoop.
+  private reachedEof = false;
   private getCurrentTime: () => number = () => 0;
   private seekInProgress = false;
   // Bumped at the start of every restartAt call — lets an overlapping
@@ -254,21 +334,28 @@ export class MkvMseSession {
       const videoMime = `video/mp4; codecs="${videoParam}"`;
       if (!MediaSource.isTypeSupported(videoMime)) return false;
 
-      let audioMime: string | null = null;
-      if (isRemuxableAudioCodecId(result.audioCodecId)) {
-        const audioParam = audioCodecsParam(result.audioCodec);
-        if (audioParam) {
-          const candidateMime = `audio/mp4; codecs="${audioParam}"`;
-          if (MediaSource.isTypeSupported(candidateMime)) audioMime = candidateMime;
-        }
+      // A file WITH audio but no track this path can play (TrueHD/DTS-only
+      // releases, most commonly) goes to direct-URL playback instead: the
+      // platform's own Matroska pipeline plays those codecs with sound, it
+      // just can't seek — and silent-but-seekable proved the worse trade on
+      // device. A file with no audio tracks at all still plays here.
+      const audioPick = this.pickAudioTrack(result);
+      if (!audioPick && (result.audioTracks?.length || result.audioCodecId)) {
+        console.warn('MkvMseSession: no playable audio track, falling back to direct URL for sound');
+        return false;
       }
-      // No usable audio is a real outcome, not a failure — video-only
-      // playback (silent) still beats falling all the way back to
-      // direct-URL, since that's where the unfixable seek failure lives.
+      const audioMime = audioPick?.mime ?? null;
+      this.audioTrack = audioPick?.track;
+      console.warn(
+        `MkvMseSession: video ${result.videoCodecId} as ${videoMime}; audio ${
+          audioPick ? `track ${audioPick.track.trackNumber} ${audioPick.track.codecId} as ${audioMime}` : 'NONE (silent)'
+        }`,
+      );
 
       this.initResult = result;
       this.videoMime = videoMime;
       this.audioMime = audioMime;
+      this.initSubtitleTracks();
       if (!this.openSessions()) return false;
 
       this.initSegmentEnd = result.initSegmentEnd;
@@ -444,6 +531,8 @@ export class MkvMseSession {
 
       this.nextFetchOffset = landing.offset;
       this.lastTrimAt = 0;
+      this.reachedEof = false;
+      this.consecutiveStalls = 0;
 
       // One window is enough to start on: it's ~4MB, and the forward loop
       // takes over from here. If this window happens to hold no keyframe
@@ -504,11 +593,19 @@ export class MkvMseSession {
     // Ordering matters: abort() first (it also cancels any pending
     // append/remove), then remove() to drop the data, then set the offset
     // once the remove has settled.
+    //
+    // abort() is called a second time after the remove, too. abort() throws
+    // unless the MediaSource is "open", and it is NOT open once playback has
+    // reached the end of the file: the forward loop calls endOfStream()
+    // there, which moves it to "ended". So a rewind from the end silently
+    // skipped the parser-state reset above. remove() (like appendBuffer)
+    // moves an ended MediaSource back to "open", so the second abort() is
+    // the one that actually lands in that case.
     try {
       sb.abort();
     } catch {
-      // Only throws if the MediaSource isn't "open" (already torn down) —
-      // nothing to reset in that case.
+      // MediaSource not "open" — ended (handled by the second abort below)
+      // or already torn down.
     }
     const end = this.durationSeconds > 0 ? this.durationSeconds : Number.MAX_SAFE_INTEGER;
     await new Promise<void>(resolve => {
@@ -524,6 +621,11 @@ export class MkvMseSession {
         resolve();
       }
     });
+    try {
+      sb.abort();
+    } catch {
+      // Still not open — torn down; nothing to reset.
+    }
     try {
       sb.timestampOffset = offsetSeconds;
     } catch {
@@ -575,27 +677,78 @@ export class MkvMseSession {
     );
     if (this.videoSessionId < 0) return false;
 
-    if (this.audioMime) {
+    const audio = this.audioTrack;
+    if (this.audioMime && audio) {
       this.audioSessionId = MkvDemuxModule.openRemuxSession(
-        result.audioCodecId,
-        base64ToArrayBuffer(result.audioCodecPrivateB64),
-        result.audioTrackNumber,
-        result.audioSampleRate,
-        result.audioChannels,
+        audio.codecId,
+        base64ToArrayBuffer(audio.codecPrivateB64),
+        audio.trackNumber,
+        audio.sampleRate,
+        audio.channels,
         result.timestampScale,
         0,
       );
-      this.activeAudioTrackNumber = this.audioSessionId >= 0 ? result.audioTrackNumber : undefined;
+      this.activeAudioTrackNumber = this.audioSessionId >= 0 ? audio.trackNumber : undefined;
+      if (this.audioSessionId < 0) console.warn(`MkvMseSession: native refused audio track ${audio.trackNumber} (${audio.codecId})`);
     }
     return true;
+  }
+
+  // The file's default audio track when this platform can decode it,
+  // otherwise the first track it can — a dual-audio release whose default
+  // track is in an unsupported codec should still play with sound, just in
+  // its other language (the Audio menu can switch back if that ever becomes
+  // playable). Falls back to the init result's primary fields for a file
+  // whose audioTracks list is somehow empty.
+  private pickAudioTrack(result: MkvDemuxInitResult): { track: MkvDemuxAudioTrack; mime: string } | undefined {
+    const tracks: MkvDemuxAudioTrack[] = result.audioTracks?.length
+      ? result.audioTracks
+      : result.audioCodecId
+      ? [
+          {
+            trackNumber: result.audioTrackNumber,
+            codecId: result.audioCodecId,
+            codec: result.audioCodec,
+            sampleRate: result.audioSampleRate,
+            channels: result.audioChannels,
+            language: 'und',
+            name: '',
+            codecPrivateB64: result.audioCodecPrivateB64,
+            isDefault: true,
+          },
+        ]
+      : [];
+    const primary = tracks.find(t => t.trackNumber === result.audioTrackNumber);
+    const ordered = primary ? [primary, ...tracks.filter(t => t !== primary)] : tracks;
+    for (const track of ordered) {
+      const mime = supportedAudioMime(track.codecId);
+      if (mime) return { track, mime };
+      console.warn(`MkvMseSession: audio track ${track.trackNumber} (${track.codecId}, ${track.language}) not playable here`);
+    }
+    return undefined;
+  }
+
+  private initSubtitleTracks(): void {
+    this.subtitleTrackIsAss = new Map();
+    this.subtitleTrackMask = 0;
+    for (const t of this.getSubtitleTracks()) {
+      if (t.trackNumber < 1 || t.trackNumber > 52) continue;
+      this.subtitleTrackIsAss.set(t.trackNumber, t.codecId !== 'S_TEXT/UTF8');
+      this.subtitleTrackMask += 2 ** t.trackNumber;
+    }
   }
 
   // Every audio track this file has, for a track-selection menu — the
   // primary audioCodec/audioTrackNumber on the init result is just
   // whichever one of these was chosen as the default (see
   // MkvDemuxInitResult's own comment).
+  //
+  // Only tracks this platform can actually play are listed, so every entry
+  // in the Audio menu works when picked — a dual-audio file with one
+  // unsupported track (e.g. TrueHD next to FLAC) used to show both, and
+  // choosing the unsupported one silently did nothing.
   getAudioTracks(): MkvDemuxAudioTrack[] {
-    return this.initResult?.audioTracks ?? [];
+    return (this.initResult?.audioTracks ?? []).filter(t => supportedAudioMime(t.codecId) !== null);
   }
 
   getActiveAudioTrackNumber(): number | undefined {
@@ -621,10 +774,8 @@ export class MkvMseSession {
     const track = this.initResult.audioTracks.find(t => t.trackNumber === trackNumber);
     if (!track || trackNumber === this.activeAudioTrackNumber) return false;
 
-    const family = audioCodecsParam(track.codec);
-    if (!family) return false; // codec not remuxable, or not one MSE here accepts
-    const newMime = `audio/mp4; codecs="${family}"`;
-    if (!MediaSource.isTypeSupported(newMime)) return false;
+    const newMime = supportedAudioMime(track.codecId);
+    if (!newMime) return false; // codec not remuxable, or not one this platform decodes
 
     const myGeneration = ++this.seekGeneration;
     const stale = () => this.seekGeneration !== myGeneration;
@@ -665,10 +816,18 @@ export class MkvMseSession {
       );
       if (this.audioSessionId < 0 || stale()) return false;
 
-      if (!this.audioSourceBuffer) this.audioSourceBuffer = this.mediaSource.addSourceBuffer(newMime);
+      if (!this.audioSourceBuffer) {
+        try {
+          this.audioSourceBuffer = this.mediaSource.addSourceBuffer(newMime);
+        } catch (e) {
+          console.warn('MkvMseSession: could not add an audio SourceBuffer mid-playback —', e);
+          return false;
+        }
+      }
       await this.resetSourceBuffer(this.audioSourceBuffer, landing.sec);
       if (stale()) return false;
 
+      this.audioTrack = track;
       this.activeAudioTrackNumber = trackNumber;
 
       // Feed windows of just the audio track, starting at the landing
@@ -709,52 +868,62 @@ export class MkvMseSession {
     );
   }
 
-  // Activates (or, with `trackNumber: null`, deactivates) embedded-subtitle
-  // extraction. Resets the accumulated cue list — switching tracks means
-  // starting over, and there's no way to retroactively extract cues for
-  // territory already fetched under a DIFFERENT track's extraction target
-  // (it was never asked for, and the bytes are gone once consumed by
-  // remuxChunk/dropped by SourceBuffer trimming).
-  selectEmbeddedSubtitleTrack(trackNumber: number | null, isAss: boolean): void {
-    this.subtitleSourceTrackNumber = trackNumber ?? undefined;
-    this.subtitleIsAss = isAss;
-    this.embeddedCues = [];
-    this.embeddedCueKeys = new Set();
+  // Picks which embedded track getEmbeddedSubtitleCues returns (null turns
+  // embedded subtitles off). Cheap and instant: cues for every text track
+  // are already being harvested from each fetched window (see
+  // activeSubtitleTrack's comment), so a newly selected track immediately
+  // has everything fetched so far. `_isAss` is kept for API compatibility;
+  // each track's format is known from the init segment.
+  selectEmbeddedSubtitleTrack(trackNumber: number | null, _isAss: boolean): void {
+    this.activeSubtitleTrack = trackNumber ?? undefined;
+    if (trackNumber !== null) {
+      console.warn(
+        `MkvMseSession: embedded subtitle track ${trackNumber} selected, ${
+          this.cuesByTrack.get(trackNumber)?.length ?? 0
+        } cues so far`,
+      );
+    }
   }
 
   // Live, growing list — call this fresh each time cues are needed (e.g.
   // every subtitle-overlay tick) rather than caching the reference for
   // long, since more cues arrive as playback/fetching advances.
   getEmbeddedSubtitleCues(): SrtCue[] {
-    return this.embeddedCues;
+    if (this.activeSubtitleTrack === undefined) return [];
+    return this.cuesByTrack.get(this.activeSubtitleTrack) ?? [];
   }
 
-  // Extracts cues for the active embedded subtitle track (if any) from a
-  // window already fetched for video/audio — see subtitleSourceTrackNumber's
-  // comment for why this piggybacks rather than fetching separately.
-  private extractEmbeddedCues(clustersInput: ArrayBuffer): void {
-    if (this.subtitleSourceTrackNumber === undefined) return;
-    const parsed: { cues?: { startTicks: number; durationTicks: number; text: string }[] } = JSON.parse(
-      MkvDemuxModule.extractTextCues(clustersInput, this.subtitleSourceTrackNumber, this.subtitleIsAss),
-    );
+  // Harvests cues for every text subtitle track from a window already
+  // fetched for video/audio, in one native pass — see activeSubtitleTrack's
+  // comment for why every track rather than just the selected one.
+  private extractEmbeddedCues(input: ArrayBuffer): void {
+    if (this.subtitleTrackMask <= 0) return;
+    const parsed: { cues?: { track: number; startTicks: number; durationTicks: number; text: string }[] } =
+      JSON.parse(MkvDemuxModule.extractTextCues(input, -this.subtitleTrackMask, false));
     if (!parsed.cues?.length) return;
-    let added = false;
+    const touched = new Set<number>();
     for (const c of parsed.cues) {
+      const isAss = this.subtitleTrackIsAss.get(c.track);
+      if (isAss === undefined) continue;
+      const text = isAss ? assDialogueText(c.text) : c.text;
+      if (!text.trim()) continue;
       const start = this.toSeconds(c.startTicks);
       const end = start + this.toSeconds(c.durationTicks);
-      const key = `${start}|${c.text}`;
-      if (this.embeddedCueKeys.has(key)) continue;
-      this.embeddedCueKeys.add(key);
-      const segments = parseCueSegments(c.text);
-      this.embeddedCues.push({ start, end, text: c.text, segments });
-      added = true;
+      const key = `${start}|${text}`;
+      let keys = this.cueKeysByTrack.get(c.track);
+      if (!keys) this.cueKeysByTrack.set(c.track, (keys = new Set()));
+      if (keys.has(key)) continue;
+      keys.add(key);
+      let cues = this.cuesByTrack.get(c.track);
+      if (!cues) this.cuesByTrack.set(c.track, (cues = []));
+      cues.push({ start, end, text, segments: parseCueSegments(text) });
+      touched.add(c.track);
     }
-    // Cues arrive in file order (Clusters are chronological), so a plain
-    // stable sort after each batch keeps the array ordered for the
-    // overlay's binary search without needing an insertion-sort — batches
-    // are small (one fetch window's worth) and this only runs when new
-    // cues actually showed up.
-    if (added) this.embeddedCues.sort((a, b) => a.start - b.start);
+    // Keeps each list ordered for the overlay's binary search. Within one
+    // window cues arrive chronologically, but a seek can land a window
+    // before territory fetched earlier, so a sort per touched track is
+    // needed; batches are one window's worth, so it's cheap.
+    for (const track of touched) this.cuesByTrack.get(track)!.sort((a, b) => a.start - b.start);
   }
 
   // ---- init segment ----
@@ -783,7 +952,11 @@ export class MkvMseSession {
 
   private enqueueAppend(sb: SourceBuffer, queueField: 'video' | 'audio', buf: ArrayBuffer): Promise<void> {
     const prior = queueField === 'video' ? this.videoAppendQueue : this.audioAppendQueue;
-    const next = prior.then(() => this.appendAndWait(sb, buf));
+    // Chained off `prior` whether it succeeded or failed: a plain .then()
+    // would make one failed append poison the queue, so every later append
+    // for that track silently never ran — audio stopping for good after a
+    // single bad fragment, while video carried on.
+    const next = prior.catch(() => undefined).then(() => this.appendAndWait(sb, buf));
     if (queueField === 'video') this.videoAppendQueue = next;
     else this.audioAppendQueue = next;
     return next;
@@ -802,6 +975,7 @@ export class MkvMseSession {
       };
       const onError = () => {
         cleanup();
+        console.warn(`MkvMseSession: SourceBuffer append error (${sb === this.audioSourceBuffer ? 'audio' : 'video'})`);
         reject(new Error('SourceBuffer append error'));
       };
       sb.addEventListener('updateend', onUpdateEnd);
@@ -841,7 +1015,7 @@ export class MkvMseSession {
     const audioInput =
       this.audioSessionId >= 0 && this.audioSourceBuffer ? buf.slice(0) : undefined;
     const clustersInput = buf.slice(0);
-    const subtitleInput = this.subtitleSourceTrackNumber !== undefined ? buf.slice(0) : undefined;
+    const subtitleInput = this.subtitleTrackMask > 0 ? buf.slice(0) : undefined;
 
     const videoResult = splitRemuxResult(MkvDemuxModule.remuxChunk(this.videoSessionId, buf, offset));
     const consumed = videoResult.bytesConsumed;
@@ -866,7 +1040,18 @@ export class MkvMseSession {
     if (audioInput !== undefined && this.audioSourceBuffer) {
       const audioResult = splitRemuxResult(MkvDemuxModule.remuxChunk(this.audioSessionId, audioInput, offset));
       if (audioResult.muxed.byteLength > 0) {
-        await this.enqueueAppend(this.audioSourceBuffer, 'audio', audioResult.muxed);
+        this.audioAppendCount++;
+        this.audioAppendBytes += audioResult.muxed.byteLength;
+        // A failed audio append must not throw out of this function: video
+        // for this window is already appended, so a throw here (before
+        // nextFetchOffset advances below) made the next tick re-fetch the
+        // same window and remux its video a second time, duplicating it
+        // further along the timeline.
+        try {
+          await this.enqueueAppend(this.audioSourceBuffer, 'audio', audioResult.muxed);
+        } catch (e) {
+          if ((e as { name?: string })?.name === 'AbortError') throw e;
+        }
       }
     }
 
@@ -927,7 +1112,16 @@ export class MkvMseSession {
       if (!this.seekInProgress) {
         try {
           const cur = this.getCurrentTime();
-          if (this.bufferedAheadOf(cur) >= BUFFER_AHEAD_TARGET_SEC) {
+          this.logDiagnostics(cur);
+          if (this.reachedEof) {
+            // Parked at the end of the file: nothing left to fetch until a
+            // seek moves the cursor back (restartAt clears reachedEof). The
+            // loop keeps ticking rather than exiting, because an exited loop
+            // is exactly what froze playback on any rewind after reaching
+            // the end — the seek appended its one landing window and then
+            // nothing ever fetched past it.
+            nextDelay = FORWARD_LOOP_MAX_STALL_INTERVAL_MS;
+          } else if (this.bufferedAheadOf(cur) >= BUFFER_AHEAD_TARGET_SEC) {
             // Buffer is healthy, so there is nothing to fetch this tick —
             // and that is itself proof we are not stalled. Clearing the
             // counter here is what makes it mean CONSECUTIVE stalls: without
@@ -939,12 +1133,12 @@ export class MkvMseSession {
           } else {
             const outcome = await this.fetchAndAppendNext();
             if (outcome === 'eof') {
+              this.reachedEof = true;
               try {
-                this.mediaSource?.endOfStream();
+                if (this.mediaSource?.readyState === 'open') this.mediaSource.endOfStream();
               } catch {
                 // Already ended/closed.
               }
-              return;
             }
             if (outcome === 'stalled') {
               // A stall used to `return` here — exiting the tick WITHOUT
@@ -956,20 +1150,23 @@ export class MkvMseSession {
               // retrying — but back off the retry interval as stalls pile
               // up, so a source that's genuinely dead settles into slow,
               // bounded polling instead of hammering the network in a tight
-              // loop. Only after MAX_CONSECUTIVE_STALLS in a row do we
-              // actually give up.
+              // loop.
+              //
+              // Even a long run of stalls no longer exits the loop — it only
+              // stops backing off further and polls at the ceiling, so a
+              // later seek (which moves the fetch cursor somewhere healthy)
+              // still has a loop to hand off to.
               this.consecutiveStalls++;
-              if (this.consecutiveStalls >= MAX_CONSECUTIVE_STALLS) {
+              if (this.consecutiveStalls === MAX_CONSECUTIVE_STALLS) {
                 console.warn(
-                  `MkvMseSession: ${this.consecutiveStalls} consecutive stalled windows, giving up on forward buffering`,
+                  `MkvMseSession: ${this.consecutiveStalls} consecutive stalled windows, polling slowly from here`,
                 );
-                return;
               }
               nextDelay = Math.min(
                 FORWARD_LOOP_INTERVAL_MS * (this.consecutiveStalls + 1),
                 FORWARD_LOOP_MAX_STALL_INTERVAL_MS,
               );
-            } else {
+            } else if (outcome === 'appended') {
               this.consecutiveStalls = 0;
             }
           }
@@ -986,6 +1183,26 @@ export class MkvMseSession {
       if (!this.disposed) this.forwardLoopHandle = setTimeout(tick, nextDelay);
     };
     this.forwardLoopHandle = setTimeout(tick, FORWARD_LOOP_INTERVAL_MS);
+  }
+
+  // Periodic one-line state dump at WARN level. The device throttles an app
+  // that logs more than ~300 lines/s by dropping its INFO lines for 16s at a
+  // time — and the media stack alone logs that much during playback — so
+  // INFO-level logging from here routinely vanishes exactly when it's
+  // needed. WARN survives the throttle.
+  private logDiagnostics(cur: number): void {
+    const now = Date.now();
+    if (now - this.lastDiagnosticsAt < 5000) return;
+    this.lastDiagnosticsAt = now;
+    console.warn(
+      `MkvMseSession: t=${cur.toFixed(1)} ms=${this.mediaSource?.readyState} video=[${describeRanges(
+        this.videoSourceBuffer,
+      )}] audio=[${describeRanges(this.audioSourceBuffer)}] audioSession=${this.audioSessionId} audioAppends=${
+        this.audioAppendCount
+      }/${this.audioAppendBytes}B next=${this.nextFetchOffset} eof=${this.reachedEof} stalls=${
+        this.consecutiveStalls
+      } subs=${this.activeSubtitleTrack ?? '-'}:${this.getEmbeddedSubtitleCues().length}`,
+    );
   }
 
   private bufferedAheadOf(cur: number): number {

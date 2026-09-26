@@ -137,6 +137,7 @@ std::string audioCodecFamily(const std::string& codecId) {
   if (codecId == "A_MPEG/L3") return "mp3";
   if (codecId == "A_MPEG/L2") return "mp2";
   if (codecId == "A_DTS") return "dts";
+  if (codecId == "A_TRUEHD") return "mlpa";
   return "";
 }
 
@@ -802,7 +803,7 @@ std::string findClusters(const uint8_t* data, size_t size, uint64_t baseOffset) 
 
 namespace {
 
-enum class RemuxKind { Unsupported, Avc, Hevc, Aac, Ac3, Eac3, Flac, Opus };
+enum class RemuxKind { Unsupported, Avc, Hevc, Aac, Ac3, Eac3, Flac, Opus, TrueHd };
 
 RemuxKind remuxKindForCodecId(const std::string& codecId) {
   if (codecId == "V_MPEG4/ISO/AVC") return RemuxKind::Avc;
@@ -812,6 +813,7 @@ RemuxKind remuxKindForCodecId(const std::string& codecId) {
   if (codecId == "A_EAC3") return RemuxKind::Eac3;
   if (codecId == "A_FLAC") return RemuxKind::Flac;
   if (codecId == "A_OPUS") return RemuxKind::Opus;
+  if (codecId == "A_TRUEHD") return RemuxKind::TrueHd;
   // DTS/MP3/MP2 etc are still not remuxed. DTS isn't decodable through MSE on
   // this platform regardless of muxing. MP3/MP2 could reuse the esds path AAC
   // already has (same OTI family, just a different sub-value) but haven't come
@@ -819,6 +821,55 @@ RemuxKind remuxKindForCodecId(const std::string& codecId) {
   // the existing raw-Matroska MSE path or direct-URL playback, same as any
   // other unsupported codec today.
   return RemuxKind::Unsupported;
+}
+
+// ---- Dolby TrueHD ------------------------------------------------------
+//
+// A TrueHD stream is a run of access units, each 40 samples at the base rate
+// (1/1200 s at 48 kHz-family rates: 40 samples at 48k, 80 at 96k, 160 at
+// 192k). Each starts with a 4-byte header: 4-bit check nibble, 12-bit
+// access_unit_length (in 16-bit words, header included), 16-bit input
+// timing. Periodically an access unit carries a "major sync" right after
+// that header — 0xF8726FBA, then format_info and the peak data rate, which
+// is exactly what the ISOBMFF dmlp box needs (Dolby's "TrueHD in ISO base
+// media file format"). Matroska's CodecPrivate is empty for TrueHD, so like
+// AC-3 those come off the first real frame; and a Matroska block packs a
+// variable number of access units, so duration is counted per block rather
+// than held constant.
+
+// Samples in one access unit at `sampleRate`.
+uint32_t trueHdSamplesPerAccessUnit(uint32_t sampleRate) {
+  if (sampleRate >= 48000 && sampleRate % 48000 == 0) return 40 * (sampleRate / 48000);
+  if (sampleRate >= 44100 && sampleRate % 44100 == 0) return 40 * (sampleRate / 44100);
+  return 40;
+}
+
+// Number of whole access units in `size` bytes of TrueHD data, 0 if the
+// data doesn't parse as a clean run of them.
+uint32_t trueHdAccessUnitCount(const uint8_t* data, size_t size) {
+  uint32_t count = 0;
+  size_t pos = 0;
+  while (pos + 4 <= size) {
+    const size_t auBytes = static_cast<size_t>(((data[pos] & 0x0F) << 8) | data[pos + 1]) * 2;
+    if (auBytes < 4 || pos + auBytes > size) return 0;
+    pos += auBytes;
+    count++;
+  }
+  return pos == size ? count : 0;
+}
+
+// dmlp box payload (MLPSpecificBox) from a frame whose first access unit
+// carries a TrueHD major sync; empty if it doesn't.
+//   unsigned int(32) format_info;
+//   unsigned int(15) peak_data_rate; unsigned int(1) reserved;
+//   unsigned int(32) reserved;
+std::vector<uint8_t> parseTrueHdDmlp(const uint8_t* data, size_t size) {
+  if (size < 20) return {};
+  if (!(data[4] == 0xF8 && data[5] == 0x72 && data[6] == 0x6F && data[7] == 0xBA)) return {};
+  const uint16_t peakDataRate = static_cast<uint16_t>(((data[18] << 8) | data[19]) & 0x7FFF);
+  const uint16_t packed = static_cast<uint16_t>(peakDataRate << 1);
+  return {data[8], data[9], data[10], data[11], static_cast<uint8_t>(packed >> 8),
+      static_cast<uint8_t>(packed & 0xFF), 0, 0, 0, 0};
 }
 
 // Opus-in-Matroska's CodecPrivate is the OpusHead identification header —
@@ -950,8 +1001,25 @@ uint32_t opusPacketDurationSamples(const uint8_t* frame, size_t size) {
 // limitation not worth a full per-frame blocksize parse for.
 bool parseFlacConfig(const uint8_t* codecPrivate, size_t size, std::vector<uint8_t>& dfLa, uint32_t& samplesPerFrame) {
   if (size < 4 + 4 + 34 || std::memcmp(codecPrivate, "fLaC", 4) != 0) return false;
-  dfLa.assign(codecPrivate + 4, codecPrivate + size);
+  if ((codecPrivate[4] & 0x7F) != 0) return false; // first metadata block must be STREAMINFO
   const uint8_t* streamInfo = codecPrivate + 8; // past "fLaC" + metadata block header
+  // dfLa carries ONLY STREAMINFO, re-flagged as the last metadata block.
+  // Copying CodecPrivate's blocks verbatim (an earlier version did) passes
+  // through whatever else the muxer stored — typically a SEEKTABLE tens of
+  // KB long — and, crucially, none of them carry the last-metadata-block
+  // flag, since in the original .flac file more headers or audio followed.
+  // ffmpeg only ever reads STREAMINFO from dfLa, so host-side checks passed;
+  // the device's GStreamer flacparse instead takes the whole thing as its
+  // streamheader, never sees the header section end, and reports every
+  // real audio frame as a decoding error. Confirmed from a device log:
+  //   streamheader=< 664c6143, 00000022..., 030068e8... >  (no 0x80 bit)
+  //   <avdec_flac>, decoding error
+  dfLa.clear();
+  dfLa.push_back(0x80); // last-metadata-block flag | type 0 (STREAMINFO)
+  dfLa.push_back(0x00);
+  dfLa.push_back(0x00);
+  dfLa.push_back(34);
+  dfLa.insert(dfLa.end(), streamInfo, streamInfo + 34);
   const uint32_t minBlockSize = (static_cast<uint32_t>(streamInfo[0]) << 8) | streamInfo[1];
   const uint32_t maxBlockSize = (static_cast<uint32_t>(streamInfo[2]) << 8) | streamInfo[3];
   samplesPerFrame = (minBlockSize == maxBlockSize && minBlockSize > 0) ? minBlockSize : maxBlockSize;
@@ -1326,6 +1394,12 @@ int openRemuxSession(const std::string& codecId, const uint8_t* codecPrivateData
     // Resolved below from CodecPrivate's STREAMINFO — everything FLAC needs
     // is available upfront, unlike AC-3/E-AC-3, so no first-frame parsing.
     session.fixedDurationUnits = 0;
+  } else if (kind == RemuxKind::TrueHd) {
+    // dmlp comes from the first frame carrying a major sync; for TrueHD this
+    // field holds samples PER ACCESS UNIT, and each block's duration is that
+    // times its access-unit count (see trueHdAccessUnitCount).
+    session.fixedDurationUnits = trueHdSamplesPerAccessUnit(param1);
+    session.needsBsiFromFirstFrame = true;
   } else if (kind == RemuxKind::Opus) {
     // Split source, unlike every other codec here: the dOps box comes from
     // CodecPrivate (set below), but packet duration is encoded per-packet in
@@ -1360,6 +1434,7 @@ int openRemuxSession(const std::string& codecId, const uint8_t* codecPrivateData
         : kind == RemuxKind::Ac3                            ? MP4_OBJECT_TYPE_AC3
         : kind == RemuxKind::Flac                           ? MP4_OBJECT_TYPE_FLAC
         : kind == RemuxKind::Opus                           ? MP4_OBJECT_TYPE_OPUS
+        : kind == RemuxKind::TrueHd                         ? MP4_OBJECT_TYPE_TRUEHD
                                                               : MP4_OBJECT_TYPE_AUDIO_ISO_IEC_14496_3;
     track.u.a.channelcount = param2; // param2 = channel count for audio
   }
@@ -1528,6 +1603,14 @@ std::vector<uint8_t> remuxChunk(int sessionId, const uint8_t* data, size_t size,
               MP4E_set_dsi(session->mux, session->mp4TrackId, dac3.data(), static_cast<int>(dac3.size()));
               parsed = true;
             }
+          } else if (session->kind == RemuxKind::TrueHd) {
+            // Frames before the first major sync can't be decoded anyway (no
+            // stream parameters yet), so dropping them is correct, not lossy.
+            std::vector<uint8_t> dmlp = parseTrueHdDmlp(frameData, frameSize);
+            if (!dmlp.empty()) {
+              MP4E_set_dsi(session->mux, session->mp4TrackId, dmlp.data(), static_cast<int>(dmlp.size()));
+              parsed = true;
+            }
           } else if (session->kind == RemuxKind::Eac3) {
             Eac3Info info;
             if (parseEac3(frameData, frameSize, info) && !info.dec3.empty()) {
@@ -1539,9 +1622,15 @@ std::vector<uint8_t> remuxChunk(int sessionId, const uint8_t* data, size_t size,
           if (!parsed) return;
           session->needsBsiFromFirstFrame = false;
         }
+        uint32_t durationUnits = session->fixedDurationUnits;
+        if (session->kind == RemuxKind::TrueHd) {
+          const uint32_t units = trueHdAccessUnitCount(frameData, frameSize);
+          if (units == 0) return; // malformed/truncated — drop rather than mis-time the track
+          durationUnits = units * session->fixedDurationUnits;
+        }
         session->samplesWritten++;
         MP4E_put_sample(session->mux, 0, frameData, static_cast<int>(frameSize),
-            static_cast<int>(session->fixedDurationUnits), keyframe ? MP4E_SAMPLE_RANDOM_ACCESS : MP4E_SAMPLE_DEFAULT);
+            static_cast<int>(durationUnits), keyframe ? MP4E_SAMPLE_RANDOM_ACCESS : MP4E_SAMPLE_DEFAULT);
       };
 
       int upper = 0;
@@ -1695,6 +1784,17 @@ std::string extractAssDialogueText(const std::string& payload) {
 // findClusters' timecode field; the caller already has toSeconds() for
 // converting those.
 std::string extractTextCues(const uint8_t* data, size_t size, uint64_t trackNumber, bool isAss) {
+  return extractTextCuesForTracks(data, size, trackNumber < 64 ? (uint64_t{1} << trackNumber) : 0, isAss, false);
+}
+
+// Multi-track form: `trackMask` bit N set means "extract Matroska track N".
+// Each cue also carries a "track" field when `tagTrack` is set, so the
+// caller can bucket one call's output per track. This exists so the caller
+// can harvest cues for EVERY text subtitle track out of each fetched window
+// in a single pass, instead of only for whichever track happens to be
+// selected — see mkvMse.ts's extractEmbeddedCues for why that matters.
+std::string extractTextCuesForTracks(const uint8_t* data, size_t size, uint64_t trackMask, bool isAss, bool tagTrack) {
+  const auto wanted = [trackMask](uint64_t track) { return track < 64 && (trackMask & (uint64_t{1} << track)) != 0; };
   try {
     BoundedMemIO io;
     io.write(data, size);
@@ -1724,13 +1824,15 @@ std::string extractTextCues(const uint8_t* data, size_t size, uint64_t trackNumb
       }
 
       uint64_t clusterTimecode = 0;
-      const auto emitCue = [&](int64_t relativeTicks, uint64_t durationTicks, const std::string& raw) {
+      const auto emitCue = [&](uint64_t track, int64_t relativeTicks, uint64_t durationTicks, const std::string& raw) {
         std::string text = isAss ? extractAssDialogueText(raw) : raw;
         if (text.empty()) return;
         if (!first) out << ",";
         first = false;
         const uint64_t startTicks = clusterTimecode + static_cast<uint64_t>(relativeTicks);
-        out << "{\"startTicks\":" << startTicks << ",\"durationTicks\":" << durationTicks << ",\"text\":\""
+        out << "{";
+        if (tagTrack) out << "\"track\":" << track << ",";
+        out << "\"startTicks\":" << startTicks << ",\"durationTicks\":" << durationTicks << ",\"text\":\""
             << jsonEscape(text) << "\"}";
       };
 
@@ -1747,10 +1849,10 @@ std::string extractTextCues(const uint8_t* data, size_t size, uint64_t trackNumb
           // point is a defined display span) — this branch exists for
           // robustness, not because it's expected to fire, so a fixed
           // fallback duration beats silently dropping the cue.
-          if (sb->TrackNum() == trackNumber) {
+          if (wanted(sb->TrackNum())) {
             for (unsigned i = 0; i < sb->NumberFrames(); ++i) {
               DataBuffer& buf = sb->GetBuffer(i);
-              emitCue(sb->GetRelativeTimestamp(), 2000,
+              emitCue(sb->TrackNum(), sb->GetRelativeTimestamp(), 2000,
                   std::string(reinterpret_cast<const char*>(buf.Buffer()), buf.Size()));
             }
           }
@@ -1778,7 +1880,7 @@ std::string extractTextCues(const uint8_t* data, size_t size, uint64_t trackNumb
               bc.SkipData(stream, EBML_CONTEXT(&bc));
             }
           });
-          if (haveBlock && blockTrackNum == trackNumber) emitCue(relativeTimestamp, durationTicks, text);
+          if (haveBlock && wanted(blockTrackNum)) emitCue(blockTrackNum, relativeTimestamp, durationTicks, text);
           delete ce;
           ce = next;
           upper = bgUpper;

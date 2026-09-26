@@ -93,4 +93,8 @@ void closeRemuxSession(int sessionId);
 // no "must start exactly at a Cluster boundary" requirement.
 std::string extractTextCues(const uint8_t* data, size_t size, uint64_t trackNumber, bool isAss);
 
+// Same, for every track whose bit is set in `trackMask` (bit N = Matroska
+// track N) in one pass; with `tagTrack`, each cue carries a "track" field.
+std::string extractTextCuesForTracks(const uint8_t* data, size_t size, uint64_t trackMask, bool isAss, bool tagTrack);
+
 } // namespace MkvDemuxCore

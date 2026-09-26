@@ -28,7 +28,7 @@ The interesting part of this project isn't the UI. It's **making MKV seekable on
 |---|---|
 | **Catalogs & search** | Movie/series browsing backed by Stremio addons, with a focus-driven hero that updates as you move the D-pad |
 | **Continue Watching** | Per-episode resume with progress bars; resuming re-resolves a current source rather than pinning to a dead link |
-| **Playback** | HEVC/H.264 video; AAC, AC-3, E-AC-3, FLAC and Opus audio |
+| **Playback** | HEVC/H.264 video; AAC, AC-3, E-AC-3, FLAC, Opus and (where the device decodes it) TrueHD audio |
 | **Seeking in MKV** | Implemented via real-time remux — partially working, see [limitations](#known-limitations) |
 | **Audio tracks** | Switch between an MKV's embedded audio tracks mid-playback, by language |
 | **Subtitles** | External (OpenSubtitles-style addons) *and* embedded MKV tracks (SRT/ASS/SSA), with styling and timing offset |
@@ -83,11 +83,14 @@ Each audio codec needs its own ISOBMFF sample entry and config box, built from w
 | E-AC-3 | `dec3` | Same, from the E-AC-3 BSI |
 | FLAC | `dfLa` | `CodecPrivate`'s STREAMINFO block |
 | Opus | `dOps` | `CodecPrivate`'s OpusHead — **byte-swapped**, since OpusHead is little-endian (Ogg heritage) and ISOBMFF is big-endian |
+| TrueHD | `dmlp` | Parsed from the first access unit carrying a major sync; durations counted per block, since a block packs a variable number of 1/1200 s access units |
 
 Two subtleties worth flagging, because both produce files that look fine and decode to garbage:
 
 - `dfLa` is a **FullBox**; `dac3`, `dec3` and `dOps` are **plain Boxes**. Getting this wrong inserts four phantom bytes and shifts every field after it.
 - Opus always decodes at 48 kHz regardless of the rate the container advertises, so the MP4 timescale is pinned to 48000 for Opus tracks.
+
+One more that only showed up on the device: every fragment needs an explicit decode time (`tfdt`) and per-sample durations. Desktop tools infer both when they're missing, so the remuxed audio checked out perfectly offline — but the Fire TV's MSE stack placed every audio fragment at time 0, leaving a zero-length audio buffer that froze playback on the first frame.
 
 ---
 
@@ -221,9 +224,9 @@ This is an active work in progress, and the MKV pipeline in particular is not fi
 
 - **Seeking in MKV is still unreliable.** The remux-and-restart approach described above works, but not consistently — large jumps in particular can leave playback stalled. The failures traced so far have been in the MSE layer rather than the remuxer (stale coded-frame-processor state surviving a buffer reset, and the fetch loop treating a single bad window as terminal), and fixes for those have landed, but it is not yet dependable.
 - **Some MKV files don't play at all.** Certain encoder/container combinations, and certain audio-track configurations, fail to start. Each one found so far has had a distinct root cause rather than a single shared one, so this is being worked through case by case.
-- **DTS and TrueHD audio aren't remuxed.** Those tracks fall back to direct-URL playback, which plays but doesn't seek.
+- **DTS audio isn't remuxed, and TrueHD depends on the device.** TrueHD is remuxed, but whether the platform decodes it (rather than only passing it through over HDMI) varies. A file with no audio track the remux path can play falls back to direct-URL playback, which has sound but doesn't seek.
 - **Image-based subtitles (PGS, VobSub) aren't supported** — only text formats. Rendering bitmap subtitles is a separate problem.
-- **Embedded subtitle cues accumulate as playback progresses.** Selecting an embedded track mid-file won't retroactively surface cues for territory already played past.
+- **Embedded subtitle cues only exist for territory that's been fetched.** Cues for every text track are collected from each downloaded window, so switching tracks is instant for everything fetched so far — but after a large jump, the skipped-over region has no cues until playback returns to it.
 - **B-frame presentation timing is approximate.** The remuxer uses each track's nominal constant frame duration rather than full composition-time offsets, which keeps decode order correct at the cost of exact sub-frame display timing.
 - **Variable-frame-size audio streams could drift.** Packet duration is read from the first frame and held constant — correct for essentially every real encoder, but not guaranteed by the specs.
 

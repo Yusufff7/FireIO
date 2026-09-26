@@ -90,6 +90,10 @@ extern "C" {
 // Likewise Opus: `Opus` sample entry + `dOps` config box (OpusSpecificBox,
 // "Encapsulation of Opus in ISOBMFF" §4.3.2).
 #define MP4_OBJECT_TYPE_OPUS                                   0xA8
+// And Dolby TrueHD: `mlpa` sample entry + `dmlp` config box (Dolby's "TrueHD
+// in ISO base media file format"). Its AudioSampleEntry samplerate field is
+// a plain 32-bit rate rather than 16.16 — see the sample-entry writer.
+#define MP4_OBJECT_TYPE_TRUEHD                                 0xA9
 
 /************************************************************************/
 /*          API error codes                                             */
@@ -614,6 +618,8 @@ enum
     BOX_dfLa    = FOUR_CHAR_INT( 'd', 'f', 'L', 'a' ),
     BOX_Opus    = FOUR_CHAR_INT( 'O', 'p', 'u', 's' ),
     BOX_dOps    = FOUR_CHAR_INT( 'd', 'O', 'p', 's' ),
+    BOX_mlpa    = FOUR_CHAR_INT( 'm', 'l', 'p', 'a' ),
+    BOX_dmlp    = FOUR_CHAR_INT( 'd', 'm', 'l', 'p' ),
 
     // http://www.itscj.ipsj.or.jp/sc29/open/29view/29n7644t.doc
     BOX_avc1    = FOUR_CHAR_INT( 'a', 'v', 'c', '1' ),
@@ -756,6 +762,11 @@ typedef struct
     unsigned int  hevc_general_profile_compat_flags;
     uint64_t      hevc_general_constraint_flags; // low 48 bits used
     unsigned char hevc_general_level_idc;
+
+    // PATCH (StremioVega/MkvDemuxModule): running decode time, in this
+    // track's timescale, of the next fragment — written into every
+    // fragment's tfdt box. See mp4e_write_fragment_header.
+    uint64_t fragment_decode_time;
 
 } track_t;
 
@@ -1079,11 +1090,7 @@ static int mp4e_flush_index(MP4E_mux_t *mux);
 /**
 *   Write Movie Fragment: 'moof' box
 */
-static int mp4e_write_fragment_header(MP4E_mux_t *mux, int track_num, int data_bytes, int duration, int kind
-#if MP4D_TFDT_SUPPORT
-, uint64_t timestamp
-#endif
-)
+static int mp4e_write_fragment_header(MP4E_mux_t *mux, int track_num, int data_bytes, int duration, int kind)
 {
     unsigned char base[888], *p = base;
     unsigned char *stack_base[20]; // atoms nesting stack
@@ -1120,20 +1127,32 @@ static int mp4e_write_fragment_header(MP4E_mux_t *mux, int track_num, int data_b
                     WRITE_4(duration);
                 }
             END_ATOM
-            #if MP4D_TFDT_SUPPORT
+            // PATCH (StremioVega/MkvDemuxModule): always write tfdt, with the
+            // track's own running decode time. Stock minimp4 only writes it
+            // under MP4D_TFDT_SUPPORT, and then as fragments_count * duration
+            // (mux-wide count, assumes a constant duration). Without any
+            // tfdt, a fragment's position is left to the MSE implementation
+            // to infer, and Fire TV's infers audio wrongly: every audio
+            // fragment landed at time 0 (buffered audio stuck at [0,0] after
+            // megabytes of appends), which froze playback on frame one for
+            // any file with an audio track.
             ATOM_FULL(BOX_tfdt, 0x01000000) // version 1
-                WRITE_4(timestamp >> 32); // upper timestamp
-                WRITE_4(timestamp & 0xffffffff); // lower timestamp
+                WRITE_4((unsigned)(tr->fragment_decode_time >> 32));
+                WRITE_4((unsigned)(tr->fragment_decode_time & 0xffffffff));
             END_ATOM
-            #endif
             if (tr->info.track_media_kind == e_audio)
             {
+                // PATCH (StremioVega/MkvDemuxModule): sample duration written
+                // per sample here too, not only as tfhd's default — Fire TV's
+                // MSE demuxer doesn't apply tfhd default_sample_duration.
                 flags  = 0;
                 flags |= 0x001;         // data-offset-present
+                flags |= 0x100;         // sample-duration-present
                 flags |= 0x200;         // sample-size-present
                 ATOM_FULL(BOX_trun, flags)
                     WRITE_4(1);         // sample_count
                     pdata_offset = p; p += 4;  // save ptr to data_offset
+                    WRITE_4(duration);  // sample_duration
                     WRITE_4(data_bytes);// sample_size
                 END_ATOM
             } else if (kind == MP4E_SAMPLE_RANDOM_ACCESS)
@@ -1194,18 +1213,11 @@ int MP4E_put_sample(MP4E_mux_t *mux, int track_num, const void *data, int data_b
 
     if (mux->enable_fragmentation)
     {
-        #if MP4D_TFDT_SUPPORT
-        // NOTE: assume a constant `duration` to calculate current timestamp
-        uint64_t timestamp = (uint64_t)mux->fragments_count * duration;
-        #endif
         if (!mux->fragments_count++)
             ERR(mp4e_flush_index(mux)); // write file headers before 1st sample
         // write MOOF + MDAT + sample data
-        #if MP4D_TFDT_SUPPORT
-        ERR(mp4e_write_fragment_header(mux, track_num, data_bytes, duration, kind, timestamp));
-        #else
         ERR(mp4e_write_fragment_header(mux, track_num, data_bytes, duration, kind));
-        #endif
+        tr->fragment_decode_time += (unsigned)duration;
         // write MDAT box for each sample
         ERR(mp4e_write_mdat_box(mux, data_bytes + 8));
         ERR(mux->write_callback(mux->write_pos, data, data_bytes, mux->token));
@@ -1514,7 +1526,8 @@ static int mp4e_flush_index(MP4E_mux_t *mux)
                                 (tr->info.object_type_indication == MP4_OBJECT_TYPE_AC3 ||
                                  tr->info.object_type_indication == MP4_OBJECT_TYPE_EAC3 ||
                                  tr->info.object_type_indication == MP4_OBJECT_TYPE_FLAC ||
-                                 tr->info.object_type_indication == MP4_OBJECT_TYPE_OPUS);
+                                 tr->info.object_type_indication == MP4_OBJECT_TYPE_OPUS ||
+                                 tr->info.object_type_indication == MP4_OBJECT_TYPE_TRUEHD);
 
                             // AudioSampleEntry() assume MP4E_HANDLER_TYPE_SOUN
                             if (tr->info.track_media_kind == e_audio)
@@ -1531,6 +1544,9 @@ static int mp4e_flush_index(MP4E_mux_t *mux)
                                 } else if (tr->info.object_type_indication == MP4_OBJECT_TYPE_OPUS)
                                 {
                                     ATOM(BOX_Opus);
+                                } else if (tr->info.object_type_indication == MP4_OBJECT_TYPE_TRUEHD)
+                                {
+                                    ATOM(BOX_mlpa);
                                 } else
                                 {
                                     ATOM(BOX_mp4a);
@@ -1551,7 +1567,13 @@ static int mp4e_flush_index(MP4E_mux_t *mux)
                                 WRITE_2(tr->info.u.a.channelcount); // channelcount
                                 WRITE_2(16); // samplesize
                                 WRITE_4(0);  // pre_defined+reserved
-                                WRITE_4((tr->info.time_scale << 16));  // samplerate == = {timescale of media}<<16;
+                                if (tr->info.object_type_indication == MP4_OBJECT_TYPE_TRUEHD)
+                                {
+                                    WRITE_4(tr->info.time_scale);  // TrueHD: plain 32-bit sampling rate, per Dolby's spec
+                                } else
+                                {
+                                    WRITE_4((tr->info.time_scale << 16));  // samplerate == = {timescale of media}<<16;
+                                }
                             }
 
                             if (is_raw_config_box)
@@ -1593,6 +1615,7 @@ static int mp4e_flush_index(MP4E_mux_t *mux)
                                 unsigned box = tr->info.object_type_indication == MP4_OBJECT_TYPE_EAC3 ? BOX_dec3
                                     : is_flac ? BOX_dfLa
                                     : tr->info.object_type_indication == MP4_OBJECT_TYPE_OPUS ? BOX_dOps
+                                    : tr->info.object_type_indication == MP4_OBJECT_TYPE_TRUEHD ? BOX_dmlp
                                     : BOX_dac3;
                                 if (is_flac)
                                 {
