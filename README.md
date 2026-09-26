@@ -32,6 +32,7 @@ The interesting part of this project isn't the UI. It's **making MKV seekable on
 | **Seeking in MKV** | Implemented via real-time remux — partially working, see [limitations](#known-limitations) |
 | **Audio tracks** | Switch between an MKV's embedded audio tracks mid-playback, by language |
 | **Subtitles** | External (OpenSubtitles-style addons) *and* embedded MKV tracks (SRT/ASS/SSA), with styling and timing offset |
+| **Backup sources** | A second set of addons to switch to in one press when the service behind your main set is down |
 | **Next episode** | Auto-derived from series metadata, so it works when resuming too |
 | **Skip intro/outro** | Chapter-aware skip prompts where timing data is available |
 
@@ -157,6 +158,10 @@ export const LOCAL_DEFAULTS = {
   streamAddonUrls: [
     'https://<addon-host>/<config>',
     // ...as many as you like; they're queried in parallel and merged
+  ] as string[],
+  // Optional: a fallback set the player can switch to (see below).
+  backupStreamAddonUrls: [
+    'https://<backup-addon-host>/<config>',
   ] as string[],
 };
 ```
