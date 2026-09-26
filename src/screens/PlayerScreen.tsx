@@ -39,6 +39,7 @@ import {
 import { colors, radius, spacing } from '../theme';
 import type { NativeStackScreenProps } from '@amazon-devices/react-navigation__native-stack';
 import type { RootStackParamList, Stream, Subtitle } from '../types';
+import { getSettingsSync, hasBackupStreamAddons, saveSettings } from '../storage/settings';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Player'>;
 
@@ -337,8 +338,14 @@ export function PlayerScreen({ route, navigation }: Props) {
   // pick from that list (which arrives here with `streamUrl` already set).
   const [allStreams, setAllStreams] = useState<Stream[]>([]);
   const [streamsLoading, setStreamsLoading] = useState(true);
+  // Which stream addon set is live — the persisted "use backup sources"
+  // switch (see Settings.useBackupStreamAddons). Part of the fetch effect's
+  // deps, so flipping it refetches from the other set.
+  const [useBackupSources, setUseBackupSources] = useState(() => getSettingsSync().useBackupStreamAddons);
+  const backupSourcesAvailable = hasBackupStreamAddons(getSettingsSync());
   useEffect(() => {
     let cancelled = false;
+    setStreamsLoading(true);
     fetchStreams(type, id)
       .then(s => !cancelled && setAllStreams(s))
       .catch(() => {})
@@ -346,7 +353,7 @@ export function PlayerScreen({ route, navigation }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [id, type]);
+  }, [id, type, useBackupSources]);
 
   // What the Resolution menu pick overrides to — seeded from Continue
   // Watching/next-episode's remembered preference where present.
@@ -389,14 +396,20 @@ export function PlayerScreen({ route, navigation }: Props) {
     // the active pick survives a skip/resolution switch untouched.
   }, []);
 
+  // Bumped by every walk, so a walk that's been superseded (the addon set
+  // was switched mid-search) stops probing and never applies its result.
+  const resolveGenRef = useRef(0);
   const runResolve = useCallback(async (list: Stream[]) => {
+    const gen = ++resolveGenRef.current;
+    const stale = () => resolveGenRef.current !== gen;
     if (list.length === 0) {
       setResolveFailed(true);
       return;
     }
     setResolveFailed(false);
     setAttempt(null);
-    const result = await resolveFirstWorking(list, a => setAttempt(a));
+    const result = await resolveFirstWorking(list, a => !stale() && setAttempt(a), stale);
+    if (stale()) return;
     if (!result) {
       setResolveFailed(true);
       return;
@@ -422,6 +435,27 @@ export function PlayerScreen({ route, navigation }: Props) {
   // is just a failed candidate, so it re-enters the same walk rather than
   // dead-ending on an error screen. When nothing is left, runResolve sets
   // resolveFailed and the error screen is finally the right answer.
+  // Flips between the primary and backup stream addon sets, then starts
+  // over: fresh stream list, fresh candidate walk. For when the service
+  // behind the primary set is down and every source times out — offered on
+  // the "trying sources" screen, the no-source error screen, and the menu.
+  const toggleBackupSources = useCallback(() => {
+    const next = !getSettingsSync().useBackupStreamAddons;
+    saveSettings({ useBackupStreamAddons: next }).catch(() => {});
+    resolveGenRef.current++; // abandon any walk in progress
+    excludedRef.current = new Set();
+    autoResolveStartedRef.current = false;
+    resetForNewSource();
+    setResolvedStream(undefined);
+    setResolveFailed(false);
+    setAttempt(null);
+    setAllStreams([]);
+    setShowTracks(false);
+    setPane('main');
+    setUseBackupSources(next);
+  }, [resetForNewSource]);
+  const backupSourcesLabel = useBackupSources ? 'Use main sources' : 'Use backup sources';
+
   const skipCurrentSource = useCallback(() => {
     if (resolvedStream) excludedRef.current.add(resolvedStream);
     const remaining = candidates.filter(s => !excludedRef.current.has(s));
@@ -1402,6 +1436,11 @@ export function PlayerScreen({ route, navigation }: Props) {
             <Focusable hasTVPreferredFocus onPress={() => navigation.goBack()} pill style={styles.errorButton}>
               <Text style={styles.errorButtonText}>Go Back</Text>
             </Focusable>
+            {backupSourcesAvailable && !error && (
+              <Focusable onPress={toggleBackupSources} pill style={styles.errorButton}>
+                <Text style={styles.errorButtonText}>{backupSourcesLabel}</Text>
+              </Focusable>
+            )}
           </View>
         </View>
       ) : !ready ? (
@@ -1412,6 +1451,13 @@ export function PlayerScreen({ route, navigation }: Props) {
             <Text style={styles.resolvingHint}>
               {attempt.failed ? `${attempt.label} — failed` : `Trying source: ${attempt.label}`}
             </Text>
+          )}
+          {backupSourcesAvailable && !resolvedUrl && (
+            <View style={styles.errorActions}>
+              <Focusable hasTVPreferredFocus onPress={toggleBackupSources} pill style={styles.errorButton}>
+                <Text style={styles.errorButtonText}>{backupSourcesLabel}</Text>
+              </Focusable>
+            </View>
           )}
         </View>
       ) : (
@@ -1634,6 +1680,16 @@ export function PlayerScreen({ route, navigation }: Props) {
                           </MenuRow>
                         )}
                       </>
+                    )}
+                    {backupSourcesAvailable && (
+                      <MenuRow onPress={toggleBackupSources}>
+                        <View style={styles.trackRowSplit}>
+                          <Text style={styles.trackRowText}>Stream sources</Text>
+                          <Text style={styles.trackRowValue} numberOfLines={1}>
+                            {useBackupSources ? 'Backup' : 'Main'}  ›
+                          </Text>
+                        </View>
+                      </MenuRow>
                     )}
 
                     <Focusable onPress={() => setShowTracks(false)} pill style={styles.trackClose}>

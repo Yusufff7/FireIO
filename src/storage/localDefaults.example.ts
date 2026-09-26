@@ -13,4 +13,8 @@ export const LOCAL_DEFAULTS = {
   // parallel and the results merged, so listing more simply widens the pool
   // of sources to choose from.
   streamAddonUrls: [] as string[],
+  // Optional fallback set, switched to from the player ("Use backup
+  // sources") when the primary set's service is down. Leave empty to hide
+  // that switch entirely.
+  backupStreamAddonUrls: [] as string[],
 };

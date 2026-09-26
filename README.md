@@ -161,6 +161,8 @@ export const LOCAL_DEFAULTS = {
 };
 ```
 
+Optionally, add a second set under `backupStreamAddonUrls`. When it's non-empty, the player offers a **Use backup sources** switch — on the "trying sources" screen, the no-source error screen, and in the player menu — for when the service behind your main addons is down. The choice is remembered until you switch back.
+
 Nothing in the app depends on *which* addons these are — only that they speak the Stremio stream protocol — so adding or removing one is a config change, not a code change.
 
 > `localDefaults.ts` is **gitignored**, because a configured addon URL usually embeds a personal API key, and anything in it gets compiled into the JS bundle. Leaving the list empty is valid; the app simply starts unconfigured.

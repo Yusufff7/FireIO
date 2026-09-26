@@ -90,11 +90,16 @@ export type ResolveAttempt = { label: string; failed: boolean };
 // succeeds. `onAttempt` fires before each try (failed: false) so the caller
 // can show "Trying source: X", and again if that attempt didn't pan out
 // (failed: true) so it can show "X failed" before the next one starts.
+// `isCancelled` lets the caller abandon the walk between attempts — e.g.
+// when the user switches to the backup addon set mid-search — instead of
+// it carrying on probing a list nobody is waiting on any more.
 export async function resolveFirstWorking(
   candidates: Stream[],
   onAttempt: (attempt: ResolveAttempt) => void,
+  isCancelled: () => boolean = () => false,
 ): Promise<{ stream: Stream; finalUrl: string; container?: SniffedContainer } | null> {
   for (const s of candidates) {
+    if (isCancelled()) return null;
     const label = s.behaviorHints?.filename || s.title || s.name || 'Unnamed release';
     onAttempt({ label, failed: false });
     try {

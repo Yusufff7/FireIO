@@ -1,5 +1,5 @@
 import type { Meta, MediaType, Stream } from '../types';
-import { getSettingsSync } from '../storage/settings';
+import { activeStreamAddonUrls, getSettingsSync } from '../storage/settings';
 
 const json = async <T>(url: string, ms = 15000): Promise<T> => {
   const ac = new AbortController();
@@ -86,8 +86,7 @@ function resolutionOf(s: Stream): string {
 
 // id is `tt0133093` (movie) or `tt0903747:1:1` (series episode)
 export async function streams(type: MediaType, id: string): Promise<Stream[]> {
-  const { streamAddonUrls } = getSettingsSync();
-  const bases = (streamAddonUrls ?? []).filter(Boolean);
+  const bases = activeStreamAddonUrls(getSettingsSync());
   if (bases.length === 0) return [];
 
   const results = await Promise.allSettled(
