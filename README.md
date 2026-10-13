@@ -6,7 +6,7 @@ Browse catalogs, search, resume where you left off, and play streams from any St
 
 The interesting part of this project isn't the UI. It's **making MKV seekable on a platform whose native player rejects Matroska seeks outright** — approached with a native C++ module that remuxes Matroska into fragmented MP4 in real time. That's the bulk of the engineering, and it's written up below.
 
-> **Status: work in progress.** The remuxing pipeline works and MKV plays. Seeking has just been redesigned around a single absolute timeline and the file's own seek index, and is still being validated on device. See [Known limitations](#known-limitations) for the current state.
+> **Status: work in progress.** MKV playback and seeking work on device: seeking was redesigned around a single absolute timeline and the file's own seek index, and skips, rewinds and long jumps are smooth on a Fire TV Stick. See [Known limitations](#known-limitations) for what's still rough.
 
 ---
 
@@ -238,7 +238,6 @@ FireIO/
 
 This is an active work in progress, and the MKV pipeline in particular is not finished. The honest current state:
 
-- **The seeking redesign is new.** It's verified offline (index parsing, absolute timestamps across a jump, drift correction against a file with a wrong frame-rate header) but still being validated on device.
 - **Files without a Cues index seek more slowly.** Without one, a seek outside the buffer needs a few probe downloads to find its position, and may land on the next keyframe rather than the one before the target.
 - **Some MKV files don't play at all.** Certain encoder/container combinations, and certain audio-track configurations, fail to start. Each one found so far has had a distinct root cause rather than a single shared one, so this is being worked through case by case.
 - **DTS audio isn't remuxed, and TrueHD depends on the device.** TrueHD is remuxed, but whether the platform decodes it (rather than only passing it through over HDMI) varies. A file with no audio track the remux path can play falls back to direct-URL playback, which has sound but doesn't seek.
