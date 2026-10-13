@@ -6,7 +6,7 @@ Browse catalogs, search, resume where you left off, and play streams from any St
 
 The interesting part of this project isn't the UI. It's **making MKV seekable on a platform whose native player rejects Matroska seeks outright** — approached with a native C++ module that remuxes Matroska into fragmented MP4 in real time. That's the bulk of the engineering, and it's written up below.
 
-> **Status: work in progress.** The remuxing pipeline works and MKV plays, but seeking is not yet reliable and some files still fail to start. See [Known limitations](#known-limitations) for the current state.
+> **Status: work in progress.** The remuxing pipeline works and MKV plays. Seeking has just been redesigned around a single absolute timeline and the file's own seek index, and is still being validated on device. See [Known limitations](#known-limitations) for the current state.
 
 ---
 
@@ -29,7 +29,7 @@ The interesting part of this project isn't the UI. It's **making MKV seekable on
 | **Catalogs & search** | Movie/series browsing backed by Stremio addons, with a focus-driven hero that updates as you move the D-pad |
 | **Continue Watching** | Per-episode resume with progress bars; resuming re-resolves a current source rather than pinning to a dead link |
 | **Playback** | HEVC/H.264 video; AAC, AC-3, E-AC-3, FLAC, Opus and (where the device decodes it) TrueHD audio |
-| **Seeking in MKV** | Implemented via real-time remux — partially working, see [limitations](#known-limitations) |
+| **Seeking in MKV** | Real-time remux with an absolute timeline and the file's Cues index — instant within what's buffered, one fetch from the right keyframe outside it |
 | **Audio tracks** | Switch between an MKV's embedded audio tracks mid-playback, by language |
 | **Subtitles** | External (OpenSubtitles-style addons) *and* embedded MKV tracks (SRT/ASS/SSA), with styling and timing offset |
 | **Backup sources** | A second set of addons to switch to in one press when the service behind your main set is down |
@@ -61,17 +61,24 @@ It also isn't fixable from JavaScript. So the only path left was to stop handing
 
 A native C++ turbo module (`MkvDemuxModule`) parses the Matroska container directly with `libebml`/`libmatroska`, and repackages the video and audio elementary streams into **fragmented MP4** using `minimp4` — no transcoding, just re-containerisation. That fMP4 is fed to MSE, which seeks correctly.
 
-Three non-obvious problems fell out of this:
+### First attempt: seek by restarting
 
-**1. Fragments carry no absolute timestamps.** `minimp4` is built without TFDT support, so each fragment's timestamp is just a session-relative counter. Feeding the decoder bytes from ten minutes in simply makes those frames "the next second of video" — which is why early attempts *looked* healthy in logs (position advanced, buffers grew, no errors) while the picture never moved.
+`minimp4` originally wrote fragments with no decode timestamp, so the player built its timeline by just adding up fragment durations — bytes from ten minutes in became "the next second of video". The first design worked around that by treating every seek as a **restart**: tear down the remux sessions and the buffered media, open fresh sessions at the target's byte offset (found by a bracketing byte-offset search), and use MSE's `timestampOffset` to place the new zero-based stream.
 
-So seeking isn't a seek at all. It's a **restart**: tear down the remux session, open a fresh one positioned at the target's byte offset, and use MSE's `timestampOffset` to declare where on the timeline that new zero-based stream belongs.
+It worked, but it was never going to feel good:
 
-**2. There's no index to seek with.** Matroska's Cues element is frequently absent or unusable in real-world files. So the target time is converted to a byte offset the way ExoPlayer's Matroska extractor falls back when Cues are missing: estimate proportionally, probe there for a Cluster, then refine from the timecode actually found.
+- **Every seek threw everything away**, even a 10-second skip into media that was already buffered, and re-downloaded it.
+- **Finding the target took several sequential probe downloads**, and when the search didn't converge the seek failed and the scrub bar snapped back.
+- **It landed on a Cluster, not a keyframe.** Video can only start at a keyframe — often seconds later — so the picture stalled, or ran seconds ahead of the audio and subtitles.
+- **Every track was timed by counting** nominal frame durations, so any error in the file's declared frame rate accumulated into audible drift.
 
-The refinement uses a **bracketing interpolation search** rather than extrapolating from an average bitrate. Real encodes vary 2–3x between static and busy scenes, so a single global average overshoots badly on large jumps; interpolating between two real bracketing samples self-corrects for local bitrate and converges in a handful of probes.
+### The redesign: one absolute timeline
 
-**3. Decoders can't start mid-GOP.** A session opened at an arbitrary byte offset drops frames until it reaches a real keyframe, because anything before that references frames the decoder never saw.
+- **Every sample carries its real media time.** The remuxer writes an explicit decode time (`tfdt`) on each fragment, taken from the Matroska timestamps. One remux session per track lives for the whole playback; whenever the byte offset it's fed jumps, it re-anchors to the real time of the next sample (and video waits for a keyframe). Media from different parts of the file can therefore sit in the `SourceBuffer`s side by side at their true positions — nothing is torn down to seek.
+- **Seeking within what's buffered is instant** — the player just moves. That covers most skips, and every rewind within the last 30 seconds.
+- **Seeking elsewhere uses the file's own index.** Most MKVs carry a Cues element mapping keyframe times to byte positions. It's located through the SeekHead, read once in the background with a small byte-level EBML reader, and turns a seek into a single fetch starting exactly on the keyframe at or before the target. Files without Cues fall back to the bracketing search, which interpolates between the nearest probes on either side because bitrate varies too much across a file for one global estimate.
+- **Both tracks are locked to the container's timestamps.** Audio is checked on every frame and video at every keyframe (where the true frame rate is also re-measured), so a wrong declared frame rate can't drift lip-sync.
+- **The player moves once.** `seek()` resolves only when the target is playable, so the playhead never lands in an empty stretch and gets pulled back. A single fetch loop keeps about a minute buffered ahead, relocates whenever the buffer isn't continuous, and evicts media far from the playhead so memory stays bounded.
 
 ### Audio
 
@@ -112,7 +119,8 @@ One more that only showed up on the device: every fragment needs an explicit dec
 │  MkvDemuxModule (C++)                                    │
 │                                                          │
 │  parseInitSegment   Tracks, codecs, languages, duration  │
-│  findClusters       Cluster offsets + timecodes (seek)   │
+│  findClusters       Cluster offsets + timecodes          │
+│  parseCues          Seek index: keyframe time ──▶ bytes  │
 │  remuxChunk         Matroska Blocks ──▶ fragmented MP4   │
 │  extractTextCues    Embedded subtitle cues               │
 │                                                          │
@@ -203,6 +211,7 @@ cd test && cmake -B build && cmake --build build
 | `seek_converge` | Whether the seek search actually converges on a target time |
 | `seek_e2e` | End-to-end seek: locate, restart, remux, write a playable file |
 | `subs_probe` | Embedded subtitle cue extraction |
+| `cues_probe` | Seek-index parsing, and one remux session fed across a jump (checks the absolute timeline) |
 
 Building these under AddressSanitizer is how a memory-safety bug in the upstream EBML library was found — an unsigned subtraction that underflowed into a multi-gigabyte `memcpy` whenever parsing started from an arbitrary byte offset, which is exactly what seeking does.
 
@@ -229,13 +238,13 @@ FireIO/
 
 This is an active work in progress, and the MKV pipeline in particular is not finished. The honest current state:
 
-- **Seeking in MKV is still unreliable.** The remux-and-restart approach described above works, but not consistently — large jumps in particular can leave playback stalled. The failures traced so far have been in the MSE layer rather than the remuxer (stale coded-frame-processor state surviving a buffer reset, and the fetch loop treating a single bad window as terminal), and fixes for those have landed, but it is not yet dependable.
+- **The seeking redesign is new.** It's verified offline (index parsing, absolute timestamps across a jump, drift correction against a file with a wrong frame-rate header) but still being validated on device.
+- **Files without a Cues index seek more slowly.** Without one, a seek outside the buffer needs a few probe downloads to find its position, and may land on the next keyframe rather than the one before the target.
 - **Some MKV files don't play at all.** Certain encoder/container combinations, and certain audio-track configurations, fail to start. Each one found so far has had a distinct root cause rather than a single shared one, so this is being worked through case by case.
 - **DTS audio isn't remuxed, and TrueHD depends on the device.** TrueHD is remuxed, but whether the platform decodes it (rather than only passing it through over HDMI) varies. A file with no audio track the remux path can play falls back to direct-URL playback, which has sound but doesn't seek.
 - **Image-based subtitles (PGS, VobSub) aren't supported** — only text formats. Rendering bitmap subtitles is a separate problem.
 - **Embedded subtitle cues only exist for territory that's been fetched.** Cues for every text track are collected from each downloaded window, so switching tracks is instant for everything fetched so far — but after a large jump, the skipped-over region has no cues until playback returns to it.
 - **B-frame presentation timing is approximate.** The remuxer uses each track's nominal constant frame duration rather than full composition-time offsets, which keeps decode order correct at the cost of exact sub-frame display timing.
-- **Variable-frame-size audio streams could drift.** Packet duration is read from the first frame and held constant — correct for essentially every real encoder, but not guaranteed by the specs.
 
 ---
 

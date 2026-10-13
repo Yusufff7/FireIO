@@ -27,6 +27,7 @@ void MkvDemuxModuleSpec::aggregateMethods(MethodAggregator<KeplerTurboModule>& m
   methodAggregator.addMethod("remuxChunk", &MkvDemuxModuleSpec::remuxChunk);
   methodAggregator.addMethod("closeRemuxSession", &MkvDemuxModuleSpec::closeRemuxSession);
   methodAggregator.addMethod("extractTextCues", &MkvDemuxModuleSpec::extractTextCues);
+  methodAggregator.addMethod("parseCues", &MkvDemuxModuleSpec::parseCues);
 }
 
 } // namespace MkvDemuxModuleTurboModule

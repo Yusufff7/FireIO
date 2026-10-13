@@ -41,6 +41,7 @@ public:
   virtual com::amazon::kepler::turbomodule::ArrayBuffer remuxChunk(double sessionId, com::amazon::kepler::turbomodule::ArrayBuffer chunk, double baseOffset) = 0;
   virtual void closeRemuxSession(double sessionId) = 0;
   virtual std::string extractTextCues(com::amazon::kepler::turbomodule::ArrayBuffer chunk, double trackNumber, bool isAss) = 0;
+  virtual std::string parseCues(com::amazon::kepler::turbomodule::ArrayBuffer chunk) = 0;
 };
 
 } // namespace MkvDemuxModuleTurboModule

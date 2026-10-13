@@ -984,18 +984,17 @@ export function PlayerScreen({ route, navigation }: Props) {
       }, SEEK_SETTLE_MS);
     };
 
-    // MSE-backed sources can't be seeked in the ordinary sense: the
-    // remuxed fragments carry no absolute timestamps, so the player's
-    // timeline is just "everything appended so far, in order" and asking
-    // it to jump within that means nothing. restartAt rebuilds the stream
-    // at the target position instead and reports the media time it
-    // actually landed on (the nearest Cluster boundary), which is what
-    // gets written below. Direct-URL sources seek natively and skip
-    // straight to the same bare write as always.
+    // MSE-backed (remuxed MKV) sources get the target's media buffered
+    // first: MkvMseSession.seek returns straight away when it's already
+    // buffered, otherwise fetches from the keyframe at or before it, and
+    // either way reports the position playback can actually start at. The
+    // single write below then lands in playable data instead of an empty
+    // stretch the player would stall on. Direct-URL sources seek natively
+    // and skip straight to the same bare write as always.
     const mse = mseSessionRef.current;
     if (mse) {
       mse
-        .restartAt(target)
+        .seek(target)
         .catch(e => {
           console.warn('MkvMseSession: seek restart threw, not writing —', e);
           return null;

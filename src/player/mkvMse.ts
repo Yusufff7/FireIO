@@ -8,34 +8,36 @@ import MkvDemuxModule, {
 } from '@amazon-devices/mkvdemuxmodule';
 import { parseCueSegments, type SrtCue } from '../addons/subtitles';
 
-// Feeds a remuxed fragmented-MP4 stream into a MediaSource, instead of
-// handing an MKV URL straight to the player's `.src` — or, as an earlier
-// version of this file did, feeding raw Matroska bytes into an MSE
-// SourceBuffer directly.
+// Plays an MKV through MediaSource Extensions by remuxing it to fragmented
+// MP4 on the fly, because this platform's native player cannot seek
+// Matroska at all (it fails the same way whether handed a URL or raw
+// Matroska bytes through MSE — the limitation is in its Matroska parsing,
+// not the codecs; HEVC-in-MP4 seeks fine).
 //
-// That raw-Matroska approach played back fine but did NOT fix seeking:
-// device testing showed the exact same native failure (`Internal error 0` /
-// `MPB Call failed with code: 50004`) through MSE as over a plain
-// progressive URL, and a follow-up test proved it wasn't a codec issue
-// either (HEVC-in-MP4 seeks correctly on this platform). The failure is
-// specific to Matroska container parsing, at a layer MSE's own
-// `video/x-matroska` SourceBuffer still has to go through internally —
-// wrapping the bytes in MSE never bypassed it.
+// How it fits together:
 //
-// So this module now remuxes MKV into fragmented MP4 on the fly (via
-// MkvDemuxModule's openRemuxSession/remuxChunk, one independent session per
-// track — see MkvDemuxCore.h's comment on openRemuxSession for why video
-// and audio are two completely separate fMP4 streams, each fed to its own
-// SourceBuffer) and feeds THAT to MSE, since MP4 is what's confirmed to
-// seek correctly here.
+//  - MkvDemuxModule keeps ONE remux session per track for the whole
+//    playback and stamps every sample with its real media time. Bytes from
+//    anywhere in the file can be fed in any order; whenever the byte offset
+//    jumps, the session re-anchors (and video waits for a keyframe). So
+//    everything appended lands at its true position on a single timeline,
+//    and the SourceBuffers can hold several separate stretches of the file
+//    at once — no timestampOffset, and nothing torn down to seek.
 //
-// Cues (a time->byte-offset index) still isn't something these files
-// reliably have, so seeking into a not-yet-buffered region is handled the
-// same way ExoPlayer's MatroskaExtractor falls back when Cues are missing:
-// estimate a byte offset proportionally from (targetTime / duration),
-// probe it via findClusters (unrelated to remuxing — just Cluster
-// boundaries and timecodes, cheap to call speculatively), and refine from
-// the Cluster timecode actually found there.
+//  - A single fetch loop keeps about a minute buffered ahead of the
+//    playhead. It fetches sequentially from a cursor while the data it needs
+//    is the continuation of what it last fetched, and otherwise relocates:
+//    to the keyframe at or before the time it needs, from the file's Cues
+//    index (read once in the background), or — for the minority of files
+//    without one — to a Cluster found by a bracketing byte-offset search.
+//
+//  - seek() moves the playhead straight there when the target is already
+//    buffered (most short skips and rewinds: no network at all). Otherwise
+//    it relocates, fetches until the target is playable, and only then
+//    reports where to land, so the player jumps once, into data it can play.
+//
+//  - Old data is evicted around the playhead (30s behind, 150s ahead) so the
+//    buffers stay bounded however much seeking happens.
 
 const INIT_FETCH_START = 2 * 1024 * 1024;
 const INIT_FETCH_MAX = 32 * 1024 * 1024;
@@ -45,19 +47,29 @@ const MAX_SEEK_ESTIMATE_ITERATIONS = 6;
 const SEEK_TOLERANCE_SEC = 4;
 const BUFFER_AHEAD_TARGET_SEC = 60;
 const BUFFER_KEEP_BEHIND_SEC = 30;
-const FORWARD_LOOP_INTERVAL_MS = 500;
-// Ceiling on the backed-off retry delay after consecutive stalls (see
-// startForwardLoop) — without a cap, a source that never recovers would
-// have the loop backing off forever instead of settling into a steady,
-// bounded polling cadence.
-const FORWARD_LOOP_MAX_STALL_INTERVAL_MS = 8000;
-// How many consecutive 'stalled' windows the forward loop retries with a
-// growing back-off before settling into slow polling at the ceiling. A single stall is routinely transient — a slow range
-// request, a window that happened to land on no complete Cluster, a hiccup
-// right after a seek — and used to kill the loop permanently on the very
-// first one (see startForwardLoop); this many in a row is what actually
-// means the source is gone.
-const MAX_CONSECUTIVE_STALLS = 10;
+const BUFFER_KEEP_AHEAD_MAX_SEC = 150;
+// Only trim once at least this much is due, so eviction doesn't issue a
+// remove() for every half-second of playback.
+const EVICT_MIN_SEC = 10;
+const LOOP_INTERVAL_MS = 250;
+const LOOP_MAX_BACKOFF_MS = 8000;
+// The fetch cursor is treated as continuing the buffered range when it
+// starts no more than this far past the range's end (a little slack for the
+// end of the range being a frame or two short of the next Cluster)...
+const CONTIGUOUS_AHEAD_SEC = 2;
+// ...or no more than this far before it: right after a relocation the
+// cursor sits on a keyframe that can be a whole GOP before the time it was
+// relocated for, and re-appending that overlap is harmless.
+const CONTIGUOUS_BEHIND_SEC = 30;
+// Without a Cues index there's no way to land on a keyframe, so filling a
+// buffer onward from a relocation starts this far back to make sure one
+// falls before the point being filled — otherwise video would have a gap
+// between the end of what's buffered and the next keyframe.
+const NO_CUES_KEYFRAME_MARGIN_SEC = 12;
+const MAX_CUES_BYTES = 16 * 1024 * 1024;
+// A range counts as covering a time within this slack of its edges: the
+// first frame of a file typically sits a few tens of ms after zero.
+const RANGE_SLACK_SEC = 0.5;
 
 // Matroska CodecIDs MkvDemuxCore's native remuxer actually knows how to
 // remux — kept in sync with MkvDemuxCore.cpp's remuxKindForCodecId(). A
@@ -200,110 +212,131 @@ function splitRemuxResult(result: ArrayBuffer): { bytesConsumed: number; muxed: 
 }
 
 type PlayerLike = { srcObject: unknown };
+type Range = { start: number; end: number };
+type Position = { offset: number; sec: number };
+
+function rangesOf(sb: SourceBuffer | null): Range[] {
+  if (!sb) return [];
+  try {
+    const b = sb.buffered;
+    const out: Range[] = [];
+    for (let i = 0; i < b.length; i++) out.push({ start: b.start(i), end: b.end(i) });
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+function intersectRanges(a: Range[], b: Range[]): Range[] {
+  const out: Range[] = [];
+  for (const x of a) {
+    for (const y of b) {
+      const start = Math.max(x.start, y.start);
+      const end = Math.min(x.end, y.end);
+      if (end > start) out.push({ start, end });
+    }
+  }
+  return out;
+}
+
+function rangeContaining(t: number, ranges: Range[]): Range | undefined {
+  return ranges.find(r => t >= r.start - RANGE_SLACK_SEC && t <= r.end + RANGE_SLACK_SEC);
+}
+
+// Total byte size (header included) of the EBML element starting at
+// bytes[0], or undefined if the header isn't complete or isn't valid.
+function ebmlElementSize(bytes: Uint8Array): number | undefined {
+  const vintLength = (b: number) => {
+    for (let i = 0; i < 8; i++) if (b & (0x80 >> i)) return i + 1;
+    return 0;
+  };
+  const idLen = vintLength(bytes[0] ?? 0);
+  if (idLen === 0 || idLen > 4 || bytes.length < idLen + 1) return undefined;
+  const sizeLen = vintLength(bytes[idLen]);
+  if (sizeLen === 0 || bytes.length < idLen + sizeLen) return undefined;
+  let size = bytes[idLen] & (0xff >> sizeLen);
+  for (let i = 1; i < sizeLen; i++) size = size * 256 + bytes[idLen + i];
+  return idLen + sizeLen + size;
+}
 
 export class MkvMseSession {
   private readonly url: string;
+  // Aborts everything for good — owned by dispose().
   private readonly abort = new AbortController();
+  // Aborts only the in-flight fetches for the current position; replaced on
+  // every relocation, so a slow response for a spot the user has left can't
+  // land after the fact.
+  private fetchAbort = new AbortController();
   private mediaSource: MediaSource | null = null;
   private videoSourceBuffer: SourceBuffer | null = null;
   private audioSourceBuffer: SourceBuffer | null = null;
-  private videoAppendQueue: Promise<void> = Promise.resolve();
-  private audioAppendQueue: Promise<void> = Promise.resolve();
+  // Every operation on a SourceBuffer (append, remove) goes through its own
+  // queue: MSE rejects a new operation while the previous one is updating.
+  private videoQueue: Promise<void> = Promise.resolve();
+  private audioQueue: Promise<void> = Promise.resolve();
 
   private videoSessionId = -1;
-  private audioSessionId = -1; // -1 whenever audio isn't remuxed (unsupported codec, or dropped after an isTypeSupported failure)
-  // Which Matroska track number audioSessionId is currently open on —
-  // undefined whenever audio isn't remuxed at all. Lets switchAudioTrack
-  // know both what the current pick is (for the track menu's checkmark)
-  // and, together with initResult.audioTracks, whether a requested switch
-  // is actually a no-op.
+  private audioSessionId = -1; // -1 whenever audio isn't remuxed
   private activeAudioTrackNumber: number | undefined;
+  // Which audio track the audio session plays — the file's default track if
+  // this platform can decode it, otherwise the first one it can.
+  private audioTrack: MkvDemuxAudioTrack | undefined;
 
-  // Embedded (in-MKV) subtitle extraction — see selectEmbeddedSubtitleTrack.
-  // Unlike audio/video there's no SourceBuffer or remux session involved:
-  // cues are just (start, end, text) triples the app-level overlay already
-  // knows how to render (see PlayerScreen's activeCues/findCue), so this is
-  // extraction only, piggybacked on the SAME bytes fetchAndAppendWindow is
-  // already pulling down for video/audio — zero extra network cost, at the
-  // price of only ever having cues for territory that's actually been
-  // fetched (same tradeoff the seek Cluster index already makes).
-  //
-  // Cues are harvested for EVERY text subtitle track on every window, not
-  // just the selected one. Extracting only the selected track (as an
-  // earlier version did) meant picking a track mid-playback showed nothing
-  // for a minute or more: the forward loop keeps ~60s buffered ahead, so all
-  // of that territory had already been fetched — and its cues skipped —
-  // before the selection was made. On-device that read as "I select the
-  // embedded subtitles and they never show up".
+  // Embedded (in-MKV) subtitles. There's no SourceBuffer for these: cues for
+  // every text track are harvested from each fetched window (one native
+  // pass per window, see extractEmbeddedCues) so that switching tracks is
+  // instant for everything fetched so far.
   private activeSubtitleTrack: number | undefined;
   private subtitleTrackIsAss = new Map<number, boolean>();
   // Bitmask of text subtitle track numbers (bit N = track N), passed to
-  // native negated — see MkvDemuxModule.cpp's extractTextCues. Kept as a
-  // plain number rather than built with bitwise ops, which truncate to 32
-  // bits in JS; tracks up to 52 fit exactly in a double.
+  // native negated — see MkvDemuxModule.cpp's extractTextCues. Built with
+  // arithmetic rather than bitwise ops, which truncate to 32 bits in JS.
   private subtitleTrackMask = 0;
   private cuesByTrack = new Map<number, SrtCue[]>();
-  // De-dupes cues across windows whose byte ranges happen to overlap (a
-  // seek's landing window can re-cover a few bytes of already-fetched
-  // territory) — start+text is a cheap, good-enough identity for a cue.
   private cueKeysByTrack = new Map<number, Set<string>>();
 
-  // Which audio track the audio session plays — chosen in prepare() as the
-  // file's default track if this platform can decode it, otherwise the
-  // first one it can (see pickAudioTrack).
-  private audioTrack: MkvDemuxAudioTrack | undefined;
-  // Diagnostics only — surfaced by logDiagnostics.
-  private audioAppendCount = 0;
-  private audioAppendBytes = 0;
-  private lastDiagnosticsAt = 0;
-
+  private initResult: MkvDemuxInitResult | null = null;
+  private audioMime: string | null = null;
   private fileSize: number | undefined;
   private initSegmentEnd = 0;
   private timestampScale = 1000000;
   private durationSeconds = 0;
-  // Every complete Cluster we've ever found via findClusters, in discovery
-  // order — used both to answer "do we already know a byte offset near
-  // this timestamp" for a rewind/re-seek, and to refine a proportional
-  // estimate for a seek into territory we haven't scanned yet. Purely a
-  // timing index; unrelated to which bytes have actually been remuxed and
-  // appended. Small enough for a whole episode (dozens to low hundreds of
-  // entries) that a linear scan is fine.
-  private clusters: MkvDemuxCluster[] = [];
-  // Where the sequential forward-playback loop fetches next. A forward seek
-  // that lands ahead of this moves it up; a rewind never moves it back, so
-  // the forward loop doesn't re-walk territory it's already passed.
-  private nextFetchOffset = 0;
-  private lastTrimAt = 0;
 
-  // Kept so a seek can re-open both remux sessions positioned somewhere
-  // else in the file — see restartAt for why seeking has to work that way.
-  private initResult: MkvDemuxInitResult | null = null;
-  private videoMime = '';
-  private audioMime: string | null = null;
-  // Aborts only the fetches belonging to the CURRENT playback position, so
-  // a seek can cancel work for the position it's abandoning without
-  // poisoning the session-wide `abort` that dispose() owns.
-  private epochAbort = new AbortController();
+  // The Cues index: keyframe times and the byte offsets of the Clusters that
+  // start with them, sorted by time. Empty until loaded (or if the file has
+  // none), in which case relocation falls back to `clusters`.
+  private keyframes: Position[] = [];
+  // Every complete Cluster seen in any fetched window or probe, by offset.
+  private clusters = new Map<number, MkvDemuxCluster>();
 
-  private forwardLoopHandle: ReturnType<typeof setTimeout> | undefined;
-  // Consecutive 'stalled' outcomes from fetchAndAppendNext, reset to 0 by
-  // any 'appended' window — see startForwardLoop's stall handling.
-  private consecutiveStalls = 0;
-  // Set once the forward loop has fetched the last byte of the file (and
-  // called endOfStream); cleared by any seek — see startForwardLoop.
+  // Where the next sequential fetch starts, and the media time its data
+  // begins at. Null until relocated somewhere.
+  private cursor: Position | null = null;
+  // Set by a relocation: the next append is not a continuation of the last
+  // one, so each SourceBuffer's parser state is reset first (see appendWindow).
+  private discontinuity = false;
   private reachedEof = false;
+
+  private loopHandle: ReturnType<typeof setTimeout> | undefined;
+  private loopBusy = false;
+  private consecutiveStalls = 0;
   private getCurrentTime: () => number = () => 0;
-  private seekInProgress = false;
-  // Bumped at the start of every restartAt call — lets an overlapping
-  // call (a second seek arriving before the first's fetch work finishes)
-  // supersede it cleanly. Without this, the FIRST call's own `finally`
-  // clears `seekInProgress` the moment IT settles, regardless of whether a
-  // second seek's fetch is still running — re-enabling the forward loop
-  // mid-seek, which then raced its own fetchAndAppendWindow call against
-  // the still-in-flight seek's, corrupting the sequential nextFetchOffset
-  // cursor.
-  private seekGeneration = 0;
+  // While true the fetch loop stands aside: seek() and switchAudioTrack()
+  // own the cursor until they finish.
+  private exclusive = false;
+  // Bumped by every seek()/switchAudioTrack(), so an overlapping newer call
+  // makes an older one abandon its remaining work.
+  private generation = 0;
   private disposed = false;
+  private lastDiagnosticsAt = 0;
+  private evicting = { video: false, audio: false };
+  // Where the playhead is about to be. Between seek() resolving and the
+  // player's currentTime actually moving, currentTime still reports the OLD
+  // position — and judged from there, the media just fetched for the target
+  // looks far away, so eviction would delete it and the fetch loop would
+  // refill around the wrong spot. The loop uses this instead until the
+  // player catches up (or it expires).
+  private pendingPosition: { sec: number; until: number } | null = null;
 
   constructor(url: string) {
     this.url = url;
@@ -313,24 +346,19 @@ export class MkvMseSession {
     return this.durationSeconds;
   }
 
-  // Fetches and parses the init segment, opens a remux session per usable
-  // track, checks whether this platform's MSE can actually play the
-  // resulting MP4 codecs, and — only if so — attaches a MediaSource to
-  // `player`, opens one SourceBuffer per track, and appends the first data
-  // chunk so there's something to play immediately. Returns false (after
-  // fully cleaning up) if MSE playback isn't viable for this file; the
-  // caller should fall back to its existing direct-URL `.src` path in that
-  // case.
+  // Fetches and parses the init segment, checks this platform's MSE can play
+  // the resulting MP4 codecs, attaches a MediaSource to `player`, and buffers
+  // the first window. Returns false (after cleaning up) when MSE playback
+  // isn't viable for this file; the caller then falls back to direct-URL
+  // playback.
   async prepare(player: PlayerLike, getCurrentTime: () => number): Promise<boolean> {
     try {
-      const initFetch = await this.fetchInitSegment();
-      if (!initFetch) return false;
-      const { result } = initFetch;
+      const result = await this.fetchInitSegment();
+      if (!result) return false;
 
       if (!isRemuxableVideoCodecId(result.videoCodecId) || result.videoDefaultDurationNs <= 0) return false;
       const videoParam = videoCodecsParam(result.videoCodec);
       if (!videoParam) return false;
-
       const videoMime = `video/mp4; codecs="${videoParam}"`;
       if (!MediaSource.isTypeSupported(videoMime)) return false;
 
@@ -344,25 +372,21 @@ export class MkvMseSession {
         console.warn('MkvMseSession: no playable audio track, falling back to direct URL for sound');
         return false;
       }
-      const audioMime = audioPick?.mime ?? null;
       this.audioTrack = audioPick?.track;
+      this.audioMime = audioPick?.mime ?? null;
       console.warn(
         `MkvMseSession: video ${result.videoCodecId} as ${videoMime}; audio ${
-          audioPick ? `track ${audioPick.track.trackNumber} ${audioPick.track.codecId} as ${audioMime}` : 'NONE (silent)'
-        }`,
+          audioPick ? `track ${audioPick.track.trackNumber} ${audioPick.track.codecId} as ${this.audioMime}` : 'NONE'
+        }; cues ${result.cuesPosition >= 0 ? 'present' : 'absent'}`,
       );
 
       this.initResult = result;
-      this.videoMime = videoMime;
-      this.audioMime = audioMime;
-      this.initSubtitleTracks();
-      if (!this.openSessions()) return false;
-
       this.initSegmentEnd = result.initSegmentEnd;
       this.timestampScale = result.timestampScale;
       this.durationSeconds = result.durationSeconds;
-      this.nextFetchOffset = result.initSegmentEnd;
       this.getCurrentTime = getCurrentTime;
+      this.initSubtitleTracks();
+      if (!this.openSessions()) return false;
 
       const ms = new MediaSource();
       this.mediaSource = ms;
@@ -373,28 +397,28 @@ export class MkvMseSession {
         };
         ms.addEventListener('sourceopen', onOpen);
       });
-      // Assigning srcObject is what triggers the sourceopen handshake —
-      // constructing the MediaSource alone does nothing.
+      // Assigning srcObject is what triggers the sourceopen handshake.
       player.srcObject = ms;
       await opened;
       if (this.disposed) return false;
 
       this.videoSourceBuffer = ms.addSourceBuffer(videoMime);
-      if (audioMime) this.audioSourceBuffer = ms.addSourceBuffer(audioMime);
+      if (this.audioMime) this.audioSourceBuffer = ms.addSourceBuffer(this.audioMime);
       if (this.durationSeconds > 0) {
         try {
           ms.duration = this.durationSeconds;
         } catch {
           // Some implementations reject a duration write before the first
-          // append; harmless either way; each SourceBuffer's own buffered
-          // ranges are what actually drive playback and seeking.
+          // append; the buffered ranges are what drive playback anyway.
         }
       }
 
-      await this.fetchAndAppendNext();
+      this.cursor = { offset: this.initSegmentEnd, sec: 0 };
+      await this.fetchWindow();
       if (this.disposed) return false;
 
-      this.startForwardLoop();
+      this.loadCues(); // background — playback doesn't wait on it
+      this.scheduleLoop(LOOP_INTERVAL_MS);
       return true;
     } catch (e) {
       console.warn('MkvMseSession: prepare failed, falling back to direct URL —', e);
@@ -403,234 +427,56 @@ export class MkvMseSession {
     }
   }
 
-  // Repositions playback to `targetSeconds` and returns the media time it
-  // actually landed on (Cluster boundaries are the finest granularity a
-  // Matroska file offers), or null if it couldn't get there — in which
-  // case the caller must leave currentTime alone.
-  //
-  // This does NOT ask the player to seek, because the remuxed stream has no
-  // seekable timeline to seek within. minimp4 writes fragments with no tfdt
-  // box (MP4D_TFDT_SUPPORT is 0), so a fragment carries no notion of where
-  // in the source it came from; the player builds its timeline purely by
-  // accumulating fragment durations in append order. Feeding it bytes from
-  // ten minutes in just makes those frames "the next second of video".
-  // That is why every earlier seek attempt looked healthy in the logs —
-  // currentTime advanced, buffered ranges grew, no errors — while the
-  // picture never actually moved to the requested position.
-  //
-  // So a seek is a restart instead: throw away the remux sessions and the
-  // buffered data, open fresh sessions positioned at the target's byte
-  // offset, and use timestampOffset to declare that this new stream (which
-  // again starts at zero) belongs at `landedSeconds` on the media timeline.
-  // Native drops frames until a real keyframe so the decoder never gets a
-  // mid-GOP frame it can't decode (see MkvDemuxCore.cpp's
-  // waitingForKeyframe).
-  // Locates the byte offset/media-time a target second value actually lands
-  // on — the network-I/O part of a seek, shared by restartAt (which
-  // rebuilds video+audio there) and switchAudioTrack (which rebuilds only
-  // the audio session there, at whatever second is currently playing).
-  // `stale` is the caller's own generation check, so an overlapping newer
-  // call from either method can still supersede this one cleanly.
-  private async findLandingOffset(
-    targetSeconds: number,
-    stale: () => boolean,
-  ): Promise<{ offset: number; sec: number } | undefined> {
-    // A known Cluster only counts if it's actually NEAR the target. The
-    // index only holds Clusters from windows already fetched — territory
-    // around where playback currently is — so for any real jump the
-    // "nearest known Cluster at or before the target" is just the last one
-    // downloaded, a second or two ahead. Taking it meant every forward
-    // press crept forward by a couple of seconds instead of jumping, and
-    // because it returned something, the byte-offset probe below (the part
-    // that can actually reach unvisited territory) never ran at all.
-    const known = this.findNearestKnownCluster(targetSeconds);
-    if (known && targetSeconds - known.sec <= SEEK_TOLERANCE_SEC) return known;
-    if (!(this.durationSeconds > 0) || this.fileSize === undefined) return undefined;
-
-    // Bracketing search: track the tightest known [lowOffset,lowSec] at or
-    // before the target and [highOffset,highSec] at or after it, and
-    // interpolate the NEXT probe from those two real samples instead of
-    // extrapolating from a single file-wide average bitrate. A global
-    // average is a poor model for real encodes — bitrate routinely varies
-    // 2-3x between static and busy scenes — so extrapolating one probe with
-    // it regularly overshot or undershot by tens of seconds on a big jump,
-    // burning through MAX_SEEK_ESTIMATE_ITERATIONS before landing within
-    // tolerance. That's what made large forward skips fail outright:
-    // restartAt returned null, and since a failed seek deliberately leaves
-    // currentTime alone, the scrub bar's optimistic position snapped back
-    // to wherever playback actually still was — "it rewinds back".
-    // Interpolating between two real bracketing samples self-corrects for
-    // local bitrate and converges reliably in a handful of iterations even
-    // on a big jump, since the function (byte offset -> timecode) is
-    // monotonic.
-    let lowOffset = this.initSegmentEnd;
-    let lowSec = 0;
-    let highOffset = this.fileSize;
-    let highSec = this.durationSeconds;
-    let estOffset = this.estimateByteOffset(targetSeconds);
-    for (let i = 0; i < MAX_SEEK_ESTIMATE_ITERATIONS; i++) {
-      let probe = await this.probeAt(estOffset);
-      if (stale()) return undefined;
-      if (!probe) {
-        // Sparse territory — this window happened to hold no complete
-        // Cluster (a long GOP, or a big non-video Cluster before the next
-        // one). Retry once with a much bigger window rather than giving up
-        // the whole search on a single empty probe.
-        probe = await this.probeAt(estOffset, SEEK_PROBE_CHUNK * 6);
-        if (stale()) return undefined;
-        if (!probe) return undefined;
-      }
-      const diff = targetSeconds - probe.timecodeSec;
-      if (Math.abs(diff) < SEEK_TOLERANCE_SEC) return { offset: probe.offset, sec: probe.timecodeSec };
-      if (probe.timecodeSec <= targetSeconds) {
-        lowOffset = probe.offset;
-        lowSec = probe.timecodeSec;
-      } else {
-        highOffset = probe.offset;
-        highSec = probe.timecodeSec;
-      }
-      estOffset =
-        highSec > lowSec
-          ? Math.round(lowOffset + ((targetSeconds - lowSec) * (highOffset - lowOffset)) / (highSec - lowSec))
-          : lowOffset;
-      estOffset = Math.max(this.initSegmentEnd, Math.min(this.fileSize - 1, estOffset));
-    }
-    return undefined;
-  }
-
-  async restartAt(targetSeconds: number): Promise<number | null> {
+  // Moves playback to `target` (seconds). Returns the position the caller
+  // should set currentTime to — `target` itself when it's playable there,
+  // otherwise where playback can actually start nearby — or null if the
+  // position couldn't be reached at all (the caller should leave currentTime
+  // alone).
+  async seek(target: number): Promise<number | null> {
     if (this.disposed || !this.videoSourceBuffer) return null;
+    const myGeneration = ++this.generation;
+    const stale = () => this.generation !== myGeneration || this.disposed;
 
-    // Captured once, up front: if a second seek arrives (bumping
-    // seekGeneration again) while this one is still awaiting a fetch, every
-    // check below sees the mismatch and this call quietly abandons the rest
-    // of its own work — the newer call is the one whose fetch result and
-    // whose `finally` gets to decide when seeking is actually done.
-    const myGeneration = ++this.seekGeneration;
-    const stale = () => this.seekGeneration !== myGeneration;
+    // Already buffered: nothing to fetch, the player seeks within what it
+    // has. This is most short skips and every rewind within the last 30s.
+    const playable = rangeContaining(target, this.playableRanges());
+    if (playable && playable.end - target >= 0.5) {
+      this.expectPosition(target);
+      this.scheduleLoop(0);
+      return target;
+    }
 
-    this.seekInProgress = true;
+    this.exclusive = true;
     try {
-      const landing = await this.findLandingOffset(targetSeconds, stale);
+      this.fetchAbort.abort();
+      this.fetchAbort = new AbortController();
+      const landing = this.keyframeAtOrBefore(target) ?? (await this.findLandingOffset(target, stale));
       if (!landing || stale()) return null;
+      this.relocateTo(landing);
 
-      // Everything from here down is local and effectively can't fail.
-      // Cancel fetches for the position being abandoned so a slow response
-      // can't append into the new stream after the reset below.
-      this.epochAbort.abort();
-      this.epochAbort = new AbortController();
-      this.videoAppendQueue = Promise.resolve();
-      this.audioAppendQueue = Promise.resolve();
-
-      this.closeSessions();
-      if (!this.openSessions()) return null;
-
-      await this.resetSourceBuffer(this.videoSourceBuffer, landing.sec);
-      if (this.audioSourceBuffer) await this.resetSourceBuffer(this.audioSourceBuffer, landing.sec);
-      if (stale()) return null;
-
-      this.nextFetchOffset = landing.offset;
-      this.lastTrimAt = 0;
-      this.reachedEof = false;
-      this.consecutiveStalls = 0;
-
-      // One window is enough to start on: it's ~4MB, and the forward loop
-      // takes over from here. If this window happens to hold no keyframe
-      // at all, keep pulling — the appends are what make the position
-      // playable, and stopping early is what left playback frozen at the
-      // landing point in an earlier version of this.
-      let appendedAny = false;
-      for (let i = 0; i < MAX_SEEK_ESTIMATE_ITERATIONS && !appendedAny; i++) {
+      // Fetch until the target is playable. The landing keyframe can be up
+      // to a GOP before the target, so this is usually one or two windows.
+      for (let i = 0; i < 8; i++) {
+        const outcome = await this.fetchWindow();
         if (stale()) return null;
-        const before = this.videoSourceBuffer.buffered.length;
-        const ok = await this.fetchAndAppendWindow(this.nextFetchOffset, CHUNK_SIZE);
-        if (stale()) return null;
-        if (!ok) break;
-        appendedAny = this.videoSourceBuffer.buffered.length > before || this.isBuffered(landing.sec);
+        if (outcome !== 'appended') break;
+        const r = rangeContaining(target, this.playableRanges());
+        if (r && r.end - target >= 1) return this.expectPosition(target);
+        // Without Cues the landing Cluster may not hold a keyframe before
+        // the target, in which case video starts at the next one — after it.
+        const after = this.playableRanges().find(x => x.start > target && x.start - target < 20 && x.end - x.start >= 1);
+        if (after) return this.expectPosition(after.start);
       }
-
-      return appendedAny ? landing.sec : null;
+      const r = rangeContaining(target, this.playableRanges());
+      return r ? this.expectPosition(target) : null;
+    } catch (e) {
+      if ((e as { name?: string })?.name !== 'AbortError') console.warn('MkvMseSession: seek failed —', e);
+      return null;
     } finally {
-      if (!stale()) this.seekInProgress = false;
-    }
-  }
-
-  // Drops everything currently buffered and declares that whatever gets
-  // appended next — a fresh remux session's output, which always starts its
-  // own timeline at zero — belongs at `offsetSeconds` on the media
-  // timeline. Without the offset, restarting mid-file would append content
-  // labelled from zero and overwrite the beginning of the movie.
-  private async resetSourceBuffer(sb: SourceBuffer, offsetSeconds: number): Promise<void> {
-    // ALWAYS abort, not just when `updating` — this is the single most
-    // important line in the seek path, and gating it on `updating` (as an
-    // earlier version did) is what made forward seeking fail intermittently
-    // and then freeze the picture outright.
-    //
-    // abort() is not merely "cancel the in-flight append". Per the MSE spec
-    // it runs the *reset parser state* algorithm, which clears the
-    // SourceBuffer's coded-frame-processing state — `last_decode_timestamp`,
-    // `last_frame_duration`, `highest_end_timestamp`,
-    // `need_random_access_point_flag`. remove() does NOT clear any of that:
-    // it drops buffered media but leaves the frame processor still believing
-    // the next sample must follow the last one it saw.
-    //
-    // That mattered because the forward loop buffers ~60s AHEAD of playback.
-    // Seek to 49s, let it buffer out to ~77s, then seek to 61s: the data is
-    // correctly removed and re-appended at 61s, but the frame processor's
-    // last_decode_timestamp is still 76.8s, so the 61s samples look like
-    // time running backwards. Confirmed verbatim from a device log:
-    //   "Discontinuity found for sample at PTS 61478000 DTS 61478000,
-    //    because last_decode_timestamp was 76784000"
-    // The decoder then stalls while the SourceBuffer keeps happily
-    // accepting appends — buffered ranges grew 61s->108s with the picture
-    // frozen on one frame, which is exactly the reported symptom.
-    //
-    // It was intermittent rather than constant purely because of the
-    // `updating` gate: a seek that happened to land mid-append DID abort and
-    // therefore worked, while one landing in an idle moment did not. Hence
-    // "forwarding kinda worked but then broke".
-    //
-    // Ordering matters: abort() first (it also cancels any pending
-    // append/remove), then remove() to drop the data, then set the offset
-    // once the remove has settled.
-    //
-    // abort() is called a second time after the remove, too. abort() throws
-    // unless the MediaSource is "open", and it is NOT open once playback has
-    // reached the end of the file: the forward loop calls endOfStream()
-    // there, which moves it to "ended". So a rewind from the end silently
-    // skipped the parser-state reset above. remove() (like appendBuffer)
-    // moves an ended MediaSource back to "open", so the second abort() is
-    // the one that actually lands in that case.
-    try {
-      sb.abort();
-    } catch {
-      // MediaSource not "open" — ended (handled by the second abort below)
-      // or already torn down.
-    }
-    const end = this.durationSeconds > 0 ? this.durationSeconds : Number.MAX_SAFE_INTEGER;
-    await new Promise<void>(resolve => {
-      const done = () => {
-        sb.removeEventListener('updateend', done);
-        resolve();
-      };
-      try {
-        sb.addEventListener('updateend', done);
-        sb.remove(0, end);
-      } catch {
-        sb.removeEventListener('updateend', done);
-        resolve();
+      if (!stale()) {
+        this.exclusive = false;
+        this.scheduleLoop(0);
       }
-    });
-    try {
-      sb.abort();
-    } catch {
-      // Still not open — torn down; nothing to reset.
-    }
-    try {
-      sb.timestampOffset = offsetSeconds;
-    } catch {
-      // Rejected only if the buffer is mid-update, which the await above
-      // has already ruled out.
     }
   }
 
@@ -638,34 +484,25 @@ export class MkvMseSession {
     if (this.disposed) return;
     this.disposed = true;
     this.abort.abort();
-    this.epochAbort.abort();
-    if (this.forwardLoopHandle !== undefined) clearTimeout(this.forwardLoopHandle);
-    this.closeSessions();
+    this.fetchAbort.abort();
+    if (this.loopHandle !== undefined) clearTimeout(this.loopHandle);
+    for (const id of [this.videoSessionId, this.audioSessionId]) {
+      if (id >= 0) MkvDemuxModule.closeRemuxSession(id);
+    }
+    this.videoSessionId = -1;
+    this.audioSessionId = -1;
     try {
       if (this.mediaSource && this.mediaSource.readyState === 'open') this.mediaSource.endOfStream();
     } catch {
-      // Already closed/errored — nothing to clean up.
+      // Already closed/errored.
     }
   }
 
-  private closeSessions(): void {
-    if (this.videoSessionId >= 0) {
-      MkvDemuxModule.closeRemuxSession(this.videoSessionId);
-      this.videoSessionId = -1;
-    }
-    if (this.audioSessionId >= 0) {
-      MkvDemuxModule.closeRemuxSession(this.audioSessionId);
-      this.audioSessionId = -1;
-    }
-  }
+  // ---- tracks ----------------------------------------------------------------
 
-  // Opens a fresh remux session per track. Called once by prepare() and
-  // again by every restartAt(), since a session's output timeline always
-  // starts at zero and only ever moves forward — see restartAt.
   private openSessions(): boolean {
     const result = this.initResult;
     if (!result) return false;
-
     this.videoSessionId = MkvDemuxModule.openRemuxSession(
       result.videoCodecId,
       base64ToArrayBuffer(result.videoCodecPrivateB64),
@@ -676,29 +513,31 @@ export class MkvMseSession {
       result.videoDefaultDurationNs,
     );
     if (this.videoSessionId < 0) return false;
-
     const audio = this.audioTrack;
     if (this.audioMime && audio) {
-      this.audioSessionId = MkvDemuxModule.openRemuxSession(
-        audio.codecId,
-        base64ToArrayBuffer(audio.codecPrivateB64),
-        audio.trackNumber,
-        audio.sampleRate,
-        audio.channels,
-        result.timestampScale,
-        0,
-      );
+      this.audioSessionId = this.openAudioSession(audio);
       this.activeAudioTrackNumber = this.audioSessionId >= 0 ? audio.trackNumber : undefined;
-      if (this.audioSessionId < 0) console.warn(`MkvMseSession: native refused audio track ${audio.trackNumber} (${audio.codecId})`);
+      if (this.audioSessionId < 0) console.warn(`MkvMseSession: native refused audio track ${audio.trackNumber}`);
     }
     return true;
   }
 
+  private openAudioSession(track: MkvDemuxAudioTrack): number {
+    return MkvDemuxModule.openRemuxSession(
+      track.codecId,
+      base64ToArrayBuffer(track.codecPrivateB64),
+      track.trackNumber,
+      track.sampleRate,
+      track.channels,
+      this.timestampScale,
+      0,
+    );
+  }
+
   // The file's default audio track when this platform can decode it,
   // otherwise the first track it can — a dual-audio release whose default
-  // track is in an unsupported codec should still play with sound, just in
-  // its other language (the Audio menu can switch back if that ever becomes
-  // playable). Falls back to the init result's primary fields for a file
+  // track is in an unsupported codec still plays with sound, in its other
+  // language. Falls back to the init result's primary fields for a file
   // whose audioTracks list is somehow empty.
   private pickAudioTrack(result: MkvDemuxInitResult): { track: MkvDemuxAudioTrack; mime: string } | undefined {
     const tracks: MkvDemuxAudioTrack[] = result.audioTracks?.length
@@ -728,6 +567,122 @@ export class MkvMseSession {
     return undefined;
   }
 
+  // Every audio track this platform can actually play, for the Audio menu —
+  // so every entry there works when picked.
+  getAudioTracks(): MkvDemuxAudioTrack[] {
+    return (this.initResult?.audioTracks ?? []).filter(t => supportedAudioMime(t.codecId) !== null);
+  }
+
+  getActiveAudioTrackNumber(): number | undefined {
+    return this.activeAudioTrackNumber;
+  }
+
+  // Switches the embedded audio track in place. Video is untouched: the new
+  // track gets its own remux session, its old audio is dropped from just
+  // before the playhead onward, and the new audio is filled in from the
+  // keyframe at or before the playhead up to the end of what video has
+  // buffered. Anything left uncovered is picked up by the fetch loop, which
+  // relocates whenever the buffer isn't continuous.
+  //
+  // A codec change (e.g. AAC <-> AC-3, common for dual-audio releases) needs
+  // a new SourceBuffer: one is bound to a single codec for its lifetime.
+  async switchAudioTrack(trackNumber: number): Promise<boolean> {
+    if (this.disposed || !this.initResult || !this.mediaSource) return false;
+    const track = this.initResult.audioTracks.find(t => t.trackNumber === trackNumber);
+    if (!track || trackNumber === this.activeAudioTrackNumber) return false;
+    const newMime = supportedAudioMime(track.codecId);
+    if (!newMime) return false;
+
+    const myGeneration = ++this.generation;
+    const stale = () => this.generation !== myGeneration || this.disposed;
+    this.exclusive = true;
+    try {
+      this.fetchAbort.abort();
+      this.fetchAbort = new AbortController();
+      const cur = this.playhead();
+      const from = this.keyframeAtOrBefore(cur) ?? this.knownClusterAtOrBefore(cur) ?? (await this.findLandingOffset(cur, stale));
+      if (!from || stale()) return false;
+
+      if (this.audioSessionId >= 0) MkvDemuxModule.closeRemuxSession(this.audioSessionId);
+      this.audioSessionId = -1;
+      if (newMime !== this.audioMime && this.audioSourceBuffer) {
+        try {
+          this.mediaSource.removeSourceBuffer(this.audioSourceBuffer);
+        } catch {
+          // Best-effort — a detached buffer isn't worth failing the switch over.
+        }
+        this.audioSourceBuffer = null;
+        this.audioQueue = Promise.resolve();
+      }
+      this.audioMime = newMime;
+      this.audioSessionId = this.openAudioSession(track);
+      if (this.audioSessionId < 0) return false;
+      if (!this.audioSourceBuffer) {
+        try {
+          this.audioSourceBuffer = this.mediaSource.addSourceBuffer(newMime);
+        } catch (e) {
+          console.warn('MkvMseSession: could not add an audio SourceBuffer mid-playback —', e);
+          return false;
+        }
+      }
+      this.audioTrack = track;
+      this.activeAudioTrackNumber = trackNumber;
+
+      const sb = this.audioSourceBuffer;
+      this.resetParser(sb);
+      await this.enqueueRemove(sb, 'audio', Math.max(0, cur - 0.5), this.removeEnd());
+      if (stale()) return false;
+
+      const videoEnd = rangeContaining(cur, rangesOf(this.videoSourceBuffer))?.end ?? cur;
+      const fillTo = Math.min(videoEnd, cur + BUFFER_AHEAD_TARGET_SEC);
+      let offset = from.offset;
+      for (let i = 0; i < 60; i++) {
+        const audioEnd = rangeContaining(cur, rangesOf(sb))?.end ?? 0;
+        if (audioEnd >= fillTo - 0.5) break;
+        const end = Math.min(offset + CHUNK_SIZE, this.fileSize ?? Number.MAX_SAFE_INTEGER) - 1;
+        if (end < offset) break;
+        const { buf } = await this.fetchBytes(offset, end);
+        if (stale()) return false;
+        if (buf.byteLength === 0) break;
+        const result = splitRemuxResult(MkvDemuxModule.remuxChunk(this.audioSessionId, buf, offset));
+        if (result.muxed.byteLength > 0) await this.enqueueAppend(sb, 'audio', result.muxed).catch(() => undefined);
+        if (stale()) return false;
+        if (result.bytesConsumed === 0) break;
+        offset += result.bytesConsumed;
+      }
+      return true;
+    } catch (e) {
+      if ((e as { name?: string })?.name !== 'AbortError') console.warn('MkvMseSession: audio switch failed —', e);
+      return false;
+    } finally {
+      if (!stale()) {
+        this.exclusive = false;
+        this.scheduleLoop(0);
+      }
+    }
+  }
+
+  // Every text subtitle track in the file (S_TEXT/UTF8, S_TEXT/ASS,
+  // S_TEXT/SSA). Image-based tracks (PGS, VobSub) aren't listed.
+  getSubtitleTracks(): MkvDemuxSubtitleTrack[] {
+    return (this.initResult?.subtitleTracks ?? []).filter(
+      t => t.codecId === 'S_TEXT/UTF8' || t.codecId === 'S_TEXT/ASS' || t.codecId === 'S_TEXT/SSA',
+    );
+  }
+
+  // Picks which embedded track getEmbeddedSubtitleCues returns (null turns
+  // embedded subtitles off). `_isAss` is kept for API compatibility; each
+  // track's format is known from the init segment.
+  selectEmbeddedSubtitleTrack(trackNumber: number | null, _isAss: boolean): void {
+    this.activeSubtitleTrack = trackNumber ?? undefined;
+  }
+
+  // Live, growing list — read it fresh on each overlay tick.
+  getEmbeddedSubtitleCues(): SrtCue[] {
+    if (this.activeSubtitleTrack === undefined) return [];
+    return this.cuesByTrack.get(this.activeSubtitleTrack) ?? [];
+  }
+
   private initSubtitleTracks(): void {
     this.subtitleTrackIsAss = new Map();
     this.subtitleTrackMask = 0;
@@ -738,164 +693,6 @@ export class MkvMseSession {
     }
   }
 
-  // Every audio track this file has, for a track-selection menu — the
-  // primary audioCodec/audioTrackNumber on the init result is just
-  // whichever one of these was chosen as the default (see
-  // MkvDemuxInitResult's own comment).
-  //
-  // Only tracks this platform can actually play are listed, so every entry
-  // in the Audio menu works when picked — a dual-audio file with one
-  // unsupported track (e.g. TrueHD next to FLAC) used to show both, and
-  // choosing the unsupported one silently did nothing.
-  getAudioTracks(): MkvDemuxAudioTrack[] {
-    return (this.initResult?.audioTracks ?? []).filter(t => supportedAudioMime(t.codecId) !== null);
-  }
-
-  getActiveAudioTrackNumber(): number | undefined {
-    return this.activeAudioTrackNumber;
-  }
-
-  // Switches which embedded audio track is playing, without touching video
-  // at all — closes only the audio remux session, reopens it on the new
-  // track, and re-fetches audio starting from wherever playback currently
-  // is. This is a smaller version of restartAt's own "throw away the
-  // session, rebuild positioned at a byte offset" approach, for the same
-  // structural reason: a remux session's output timeline always starts at
-  // zero, so switching tracks mid-stream means a fresh session either way.
-  //
-  // A codec-family change (e.g. Japanese AAC <-> English AC-3, a real and
-  // common case for dual-audio releases) needs a NEW SourceBuffer — MSE
-  // SourceBuffers are created bound to one mimeType/codec string and can't
-  // be repointed at a different codec, only appended to or reset. Same
-  // codec family reuses the existing SourceBuffer, matching restartAt's own
-  // resetSourceBuffer path.
-  async switchAudioTrack(trackNumber: number): Promise<boolean> {
-    if (this.disposed || !this.initResult || !this.mediaSource) return false;
-    const track = this.initResult.audioTracks.find(t => t.trackNumber === trackNumber);
-    if (!track || trackNumber === this.activeAudioTrackNumber) return false;
-
-    const newMime = supportedAudioMime(track.codecId);
-    if (!newMime) return false; // codec not remuxable, or not one this platform decodes
-
-    const myGeneration = ++this.seekGeneration;
-    const stale = () => this.seekGeneration !== myGeneration;
-
-    this.seekInProgress = true;
-    try {
-      const targetSeconds = this.getCurrentTime();
-      const landing = await this.findLandingOffset(targetSeconds, stale);
-      if (!landing || stale()) return false;
-
-      this.epochAbort.abort();
-      this.epochAbort = new AbortController();
-      this.audioAppendQueue = Promise.resolve();
-
-      if (this.audioSessionId >= 0) {
-        MkvDemuxModule.closeRemuxSession(this.audioSessionId);
-        this.audioSessionId = -1;
-      }
-
-      if (newMime !== this.audioMime && this.audioSourceBuffer) {
-        try {
-          this.mediaSource.removeSourceBuffer(this.audioSourceBuffer);
-        } catch {
-          // Best-effort — a stale/detached buffer isn't worth failing the switch over.
-        }
-        this.audioSourceBuffer = null;
-      }
-      this.audioMime = newMime;
-
-      this.audioSessionId = MkvDemuxModule.openRemuxSession(
-        track.codecId,
-        base64ToArrayBuffer(track.codecPrivateB64),
-        track.trackNumber,
-        track.sampleRate,
-        track.channels,
-        this.timestampScale,
-        0,
-      );
-      if (this.audioSessionId < 0 || stale()) return false;
-
-      if (!this.audioSourceBuffer) {
-        try {
-          this.audioSourceBuffer = this.mediaSource.addSourceBuffer(newMime);
-        } catch (e) {
-          console.warn('MkvMseSession: could not add an audio SourceBuffer mid-playback —', e);
-          return false;
-        }
-      }
-      await this.resetSourceBuffer(this.audioSourceBuffer, landing.sec);
-      if (stale()) return false;
-
-      this.audioTrack = track;
-      this.activeAudioTrackNumber = trackNumber;
-
-      // Feed windows of just the audio track, starting at the landing
-      // offset, until something actually appends — mirrors restartAt's own
-      // "keep pulling until buffered" loop, scoped to audio only so
-      // video's session/buffer/forward-loop cursor are never touched.
-      let offset = landing.offset;
-      let appendedAny = false;
-      for (let i = 0; i < MAX_SEEK_ESTIMATE_ITERATIONS && !appendedAny; i++) {
-        if (stale()) return false;
-        const end = this.fileSize !== undefined ? Math.min(offset + CHUNK_SIZE, this.fileSize) - 1 : offset + CHUNK_SIZE - 1;
-        if (end < offset) break;
-        const { buf, total } = await fetchRange(this.url, offset, end, this.epochAbort.signal);
-        if (stale()) return false;
-        if (total !== undefined) this.fileSize = total;
-        if (buf.byteLength === 0) break;
-        const result = splitRemuxResult(MkvDemuxModule.remuxChunk(this.audioSessionId, buf, offset));
-        if (result.muxed.byteLength > 0) {
-          await this.enqueueAppend(this.audioSourceBuffer, 'audio', result.muxed);
-          if (stale()) return false;
-          appendedAny = true;
-        }
-        if (result.bytesConsumed === 0) break;
-        offset += result.bytesConsumed;
-      }
-      return appendedAny;
-    } finally {
-      if (!stale()) this.seekInProgress = false;
-    }
-  }
-
-  // Every subtitle track this file has — text-based ones only (S_TEXT/UTF8,
-  // S_TEXT/ASS, S_TEXT/SSA). Image-based tracks (S_HDMV/PGS, S_VOBSUB)
-  // aren't in this list; extraction can't render those.
-  getSubtitleTracks(): MkvDemuxSubtitleTrack[] {
-    return (this.initResult?.subtitleTracks ?? []).filter(
-      t => t.codecId === 'S_TEXT/UTF8' || t.codecId === 'S_TEXT/ASS' || t.codecId === 'S_TEXT/SSA',
-    );
-  }
-
-  // Picks which embedded track getEmbeddedSubtitleCues returns (null turns
-  // embedded subtitles off). Cheap and instant: cues for every text track
-  // are already being harvested from each fetched window (see
-  // activeSubtitleTrack's comment), so a newly selected track immediately
-  // has everything fetched so far. `_isAss` is kept for API compatibility;
-  // each track's format is known from the init segment.
-  selectEmbeddedSubtitleTrack(trackNumber: number | null, _isAss: boolean): void {
-    this.activeSubtitleTrack = trackNumber ?? undefined;
-    if (trackNumber !== null) {
-      console.warn(
-        `MkvMseSession: embedded subtitle track ${trackNumber} selected, ${
-          this.cuesByTrack.get(trackNumber)?.length ?? 0
-        } cues so far`,
-      );
-    }
-  }
-
-  // Live, growing list — call this fresh each time cues are needed (e.g.
-  // every subtitle-overlay tick) rather than caching the reference for
-  // long, since more cues arrive as playback/fetching advances.
-  getEmbeddedSubtitleCues(): SrtCue[] {
-    if (this.activeSubtitleTrack === undefined) return [];
-    return this.cuesByTrack.get(this.activeSubtitleTrack) ?? [];
-  }
-
-  // Harvests cues for every text subtitle track from a window already
-  // fetched for video/audio, in one native pass — see activeSubtitleTrack's
-  // comment for why every track rather than just the selected one.
   private extractEmbeddedCues(input: ArrayBuffer): void {
     if (this.subtitleTrackMask <= 0) return;
     const parsed: { cues?: { track: number; startTicks: number; durationTicks: number; text: string }[] } =
@@ -919,69 +716,249 @@ export class MkvMseSession {
       cues.push({ start, end, text, segments: parseCueSegments(text) });
       touched.add(c.track);
     }
-    // Keeps each list ordered for the overlay's binary search. Within one
-    // window cues arrive chronologically, but a seek can land a window
-    // before territory fetched earlier, so a sort per touched track is
-    // needed; batches are one window's worth, so it's cheap.
+    // Kept sorted for the overlay's binary search; windows can arrive out of
+    // order now that seeking fetches from anywhere.
     for (const track of touched) this.cuesByTrack.get(track)!.sort((a, b) => a.start - b.start);
   }
 
-  // ---- init segment ----
+  // ---- fetch loop --------------------------------------------------------------
 
-  private async fetchInitSegment(): Promise<{ result: MkvDemuxInitResult } | undefined> {
-    let fetchSize = INIT_FETCH_START;
-    while (fetchSize <= INIT_FETCH_MAX) {
-      const { buf, total } = await fetchRange(this.url, 0, fetchSize - 1, this.abort.signal);
-      if (total !== undefined) this.fileSize = total;
-      // Read before handing `buf` to native — the bridge takes ownership of
-      // an ArrayBuffer argument and leaves it detached, so reading its
-      // length afterwards yields 0 (see fetchAndAppendWindow's comment).
-      const fetchedLength = buf.byteLength;
-      const result: MkvDemuxInitResult = JSON.parse(MkvDemuxModule.parseInitSegment(buf));
-      if (result.ok) return { result };
-      // A server that ignores Range (or a genuinely tiny file) returns fewer
-      // bytes than asked for — growing the window further would just
-      // refetch the same bytes and loop forever.
-      if (fetchedLength < fetchSize) return undefined;
-      fetchSize *= 4;
-    }
-    return undefined;
+  private expectPosition(sec: number): number {
+    this.pendingPosition = { sec, until: Date.now() + 10000 };
+    return sec;
   }
 
-  // ---- appending ----
+  // The playhead position the loop should work from — see pendingPosition.
+  private playhead(): number {
+    const actual = this.getCurrentTime();
+    const p = this.pendingPosition;
+    if (!p) return actual;
+    if (Date.now() > p.until || Math.abs(actual - p.sec) < 2) {
+      this.pendingPosition = null;
+      return actual;
+    }
+    return p.sec;
+  }
 
-  private enqueueAppend(sb: SourceBuffer, queueField: 'video' | 'audio', buf: ArrayBuffer): Promise<void> {
-    const prior = queueField === 'video' ? this.videoAppendQueue : this.audioAppendQueue;
-    // Chained off `prior` whether it succeeded or failed: a plain .then()
-    // would make one failed append poison the queue, so every later append
-    // for that track silently never ran — audio stopping for good after a
-    // single bad fragment, while video carried on.
-    const next = prior.catch(() => undefined).then(() => this.appendAndWait(sb, buf));
-    if (queueField === 'video') this.videoAppendQueue = next;
-    else this.audioAppendQueue = next;
+  private scheduleLoop(delay: number): void {
+    if (this.disposed) return;
+    if (this.loopHandle !== undefined) clearTimeout(this.loopHandle);
+    this.loopHandle = setTimeout(() => this.loopTick(), delay);
+  }
+
+  private async loopTick(): Promise<void> {
+    this.loopHandle = undefined;
+    if (this.disposed) return;
+    if (this.exclusive || this.loopBusy) {
+      this.scheduleLoop(LOOP_INTERVAL_MS);
+      return;
+    }
+    this.loopBusy = true;
+    let delay = LOOP_INTERVAL_MS;
+    try {
+      const cur = this.playhead();
+      this.logDiagnostics(cur);
+      this.evict(cur);
+      const outcome = await this.fillStep(cur);
+      if (outcome === 'appended') {
+        this.consecutiveStalls = 0;
+        delay = 0; // keep going until the target is reached
+      } else if (outcome === 'stalled') {
+        this.consecutiveStalls++;
+        delay = Math.min(LOOP_INTERVAL_MS * 2 ** Math.min(this.consecutiveStalls, 5), LOOP_MAX_BACKOFF_MS);
+      } else {
+        this.consecutiveStalls = 0;
+      }
+    } catch (e) {
+      if ((e as { name?: string })?.name !== 'AbortError') console.warn('MkvMseSession: fetch loop error —', e);
+    } finally {
+      this.loopBusy = false;
+    }
+    // A seek that started mid-tick owns the cursor now and reschedules the
+    // loop itself when it's done.
+    if (!this.exclusive) this.scheduleLoop(delay);
+  }
+
+  // One step of keeping the buffer ahead of the playhead.
+  private async fillStep(cur: number): Promise<'idle' | 'appended' | 'eof' | 'stalled'> {
+    const current = rangeContaining(cur, rangesOf(this.videoSourceBuffer));
+    if (current && current.end - cur >= BUFFER_AHEAD_TARGET_SEC) return 'idle';
+    const need = current ? current.end : cur;
+    if (this.durationSeconds > 0 && need >= this.durationSeconds - 0.25) {
+      this.markEndOfStream(cur);
+      return 'eof';
+    }
+
+    const c = this.cursor;
+    const continuous = c !== null && c.sec <= need + CONTIGUOUS_AHEAD_SEC && c.sec >= need - CONTIGUOUS_BEHIND_SEC;
+    if (!continuous) {
+      // Filling onward from the end of a buffered range needs data that
+      // starts at a keyframe at or before that end, or video would have a
+      // gap up to the next keyframe.
+      const landing =
+        this.keyframeAtOrBefore(need) ??
+        this.knownClusterAtOrBefore(current ? need - NO_CUES_KEYFRAME_MARGIN_SEC : need) ??
+        (await this.findLandingOffset(current ? Math.max(0, need - NO_CUES_KEYFRAME_MARGIN_SEC) : need, () => this.exclusive));
+      if (this.exclusive) return 'idle';
+      if (!landing) return 'stalled';
+      this.relocateTo(landing);
+    }
+    return this.fetchWindow();
+  }
+
+  private relocateTo(p: Position): void {
+    this.cursor = { offset: p.offset, sec: p.sec };
+    this.discontinuity = true;
+    this.reachedEof = false;
+  }
+
+  private markEndOfStream(cur: number): void {
+    // Only once playback is actually near the end: an ended MediaSource has
+    // to be reopened before anything else can be appended, and seeking back
+    // from the last few seconds is far rarer than from anywhere else.
+    if (this.reachedEof || this.durationSeconds - cur > 15) return;
+    this.reachedEof = true;
+    try {
+      if (this.mediaSource?.readyState === 'open') this.mediaSource.endOfStream();
+    } catch {
+      // Already ended/closed.
+    }
+  }
+
+  // Fetches one window at the cursor and feeds it to every consumer: video
+  // and audio remux sessions, the Cluster index, and subtitle extraction.
+  // Advances the cursor past the complete Clusters consumed.
+  private async fetchWindow(): Promise<'appended' | 'eof' | 'stalled'> {
+    const c = this.cursor;
+    if (!c) return 'stalled';
+    if (this.fileSize !== undefined && c.offset >= this.fileSize) return 'eof';
+    let consumed = await this.appendWindow(c, CHUNK_SIZE);
+    // An unusually large Cluster can exceed the normal window — retry once
+    // with a much bigger one rather than stalling on it.
+    if (consumed === 0) consumed = await this.appendWindow(c, CHUNK_SIZE * 6);
+    if (consumed > 0) return 'appended';
+    return this.fileSize !== undefined && c.offset + CHUNK_SIZE * 6 >= this.fileSize ? 'eof' : 'stalled';
+  }
+
+  private async appendWindow(at: Position, size: number): Promise<number> {
+    const end = Math.min(at.offset + size, this.fileSize ?? Number.MAX_SAFE_INTEGER) - 1;
+    if (end < at.offset) return 0;
+    const { buf } = await this.fetchBytes(at.offset, end);
+    if (buf.byteLength === 0) return 0;
+
+    // Each native call gets its own copy: the bridge may detach an
+    // ArrayBuffer argument, and this one feeds four consumers.
+    const audioInput = this.audioSessionId >= 0 && this.audioSourceBuffer ? buf.slice(0) : undefined;
+    const clustersInput = buf.slice(0);
+    const subtitleInput = this.subtitleTrackMask > 0 ? buf.slice(0) : undefined;
+
+    if (this.discontinuity) {
+      // Not a continuation of the last append: reset each SourceBuffer's
+      // parser state (abort() clears its "last decode timestamp"), or the
+      // platform treats earlier timestamps as time running backwards and
+      // stalls. Buffered data is kept — only the parser is reset.
+      this.discontinuity = false;
+      this.resetParser(this.videoSourceBuffer);
+      this.resetParser(this.audioSourceBuffer);
+    }
+
+    const video = splitRemuxResult(MkvDemuxModule.remuxChunk(this.videoSessionId, buf, at.offset));
+    const appends: Promise<void>[] = [];
+    if (video.muxed.byteLength > 0 && this.videoSourceBuffer) {
+      appends.push(this.enqueueAppend(this.videoSourceBuffer, 'video', video.muxed));
+    }
+    // Audio never decides how far the window got (video does): a window
+    // with no complete audio Blocks just means nothing for audio this time.
+    if (audioInput && this.audioSourceBuffer) {
+      const audio = splitRemuxResult(MkvDemuxModule.remuxChunk(this.audioSessionId, audioInput, at.offset));
+      if (audio.muxed.byteLength > 0) {
+        appends.push(this.enqueueAppend(this.audioSourceBuffer, 'audio', audio.muxed).catch(() => undefined));
+      }
+    }
+
+    const consumed = video.bytesConsumed;
+    let lastClusterSec: number | undefined;
+    if (consumed > 0) {
+      const parsed: MkvDemuxFindClustersResult = JSON.parse(MkvDemuxModule.findClusters(clustersInput, at.offset));
+      for (const cl of parsed.clusters) {
+        if (cl.offset + cl.size > at.offset + consumed) continue;
+        this.clusters.set(cl.offset, cl);
+        lastClusterSec = this.toSeconds(cl.timecode);
+      }
+    }
+    if (subtitleInput) {
+      // Subtitles are a nice-to-have; a failure here must never stall playback.
+      try {
+        this.extractEmbeddedCues(subtitleInput);
+      } catch (e) {
+        console.warn('MkvMseSession: embedded subtitle extraction failed —', e);
+      }
+    }
+    await Promise.all(appends);
+    if (consumed === 0) return 0;
+
+    // Advance the cursor. The media time its data starts at is the end of
+    // the video range this window extended.
+    // Capped a little past the window's last Cluster: when the window
+    // re-covered already-buffered media the range runs on well beyond it,
+    // and the cursor must describe where ITS data ends.
+    const extended = lastClusterSec !== undefined ? rangeContaining(lastClusterSec, rangesOf(this.videoSourceBuffer)) : undefined;
+    if (this.cursor === at) {
+      const sec =
+        lastClusterSec === undefined ? at.sec : extended ? Math.min(extended.end, lastClusterSec + 10) : lastClusterSec;
+      this.cursor = { offset: at.offset + consumed, sec };
+    }
+    return consumed;
+  }
+
+  private async fetchBytes(start: number, end: number): Promise<{ buf: ArrayBuffer }> {
+    const { buf, total } = await fetchRange(this.url, start, end, this.fetchAbort.signal);
+    if (total !== undefined) this.fileSize = total;
+    return { buf };
+  }
+
+  // ---- SourceBuffer operations -------------------------------------------------
+
+  private enqueue(which: 'video' | 'audio', op: () => Promise<void>): Promise<void> {
+    const prior = which === 'video' ? this.videoQueue : this.audioQueue;
+    // Chained whether the previous op succeeded or not, so one failure can't
+    // poison every later operation on that buffer.
+    const next = prior.catch(() => undefined).then(op);
+    if (which === 'video') this.videoQueue = next;
+    else this.audioQueue = next;
     return next;
   }
 
-  private appendAndWait(sb: SourceBuffer, buf: ArrayBuffer): Promise<void> {
-    if (this.disposed || buf.byteLength === 0) return Promise.resolve();
+  private enqueueAppend(sb: SourceBuffer, which: 'video' | 'audio', buf: ArrayBuffer): Promise<void> {
+    return this.enqueue(which, () => this.runUpdate(sb, () => sb.appendBuffer(buf)));
+  }
+
+  private enqueueRemove(sb: SourceBuffer, which: 'video' | 'audio', start: number, end: number): Promise<void> {
+    if (end <= start) return Promise.resolve();
+    return this.enqueue(which, () => this.runUpdate(sb, () => sb.remove(start, end)));
+  }
+
+  // Runs one append/remove and resolves when the buffer reports it done.
+  private runUpdate(sb: SourceBuffer, start: () => void): Promise<void> {
+    if (this.disposed) return Promise.resolve();
     return new Promise<void>((resolve, reject) => {
       const cleanup = () => {
-        sb.removeEventListener('updateend', onUpdateEnd);
+        sb.removeEventListener('updateend', onEnd);
         sb.removeEventListener('error', onError);
       };
-      const onUpdateEnd = () => {
+      const onEnd = () => {
         cleanup();
         resolve();
       };
       const onError = () => {
         cleanup();
-        console.warn(`MkvMseSession: SourceBuffer append error (${sb === this.audioSourceBuffer ? 'audio' : 'video'})`);
-        reject(new Error('SourceBuffer append error'));
+        reject(new Error('SourceBuffer update error'));
       };
-      sb.addEventListener('updateend', onUpdateEnd);
+      sb.addEventListener('updateend', onEnd);
       sb.addEventListener('error', onError);
       try {
-        sb.appendBuffer(buf);
+        this.reopenIfEnded();
+        start();
       } catch (e) {
         cleanup();
         reject(e);
@@ -989,207 +966,200 @@ export class MkvMseSession {
     });
   }
 
-  // Fetches [offset, offset+size) ONCE and feeds the same bytes through
-  // both the video and (if present) audio remux sessions — each session
-  // independently finds its own track's Blocks within whatever complete
-  // Clusters are in this window and mux them into fMP4, reported back via
-  // remuxChunk's bytesConsumed. The window's "fully processed" point — what
-  // advances `nextFetchOffset` and what `this.clusters` gets filtered
-  // against — is VIDEO's bytesConsumed alone; see the comment above the
-  // audio remux call below for why audio is deliberately not allowed a vote
-  // in that. Advances `nextFetchOffset` only forward, so a rewind's fetch
-  // never rewinds the sequential playback cursor.
-  private async fetchAndAppendWindow(offset: number, size: number): Promise<boolean> {
-    const end = this.fileSize !== undefined ? Math.min(offset + size, this.fileSize) - 1 : offset + size - 1;
-    if (end < offset) return false;
-    const { buf, total } = await fetchRange(this.url, offset, end, this.epochAbort.signal);
-    if (total !== undefined) this.fileSize = total;
-    if (buf.byteLength === 0) return false;
-
-    // Each native call gets its OWN copy of the window's bytes, made up
-    // front while `buf` is still guaranteed intact — the Kepler bridge's
-    // ownership semantics for an ArrayBuffer argument aren't documented,
-    // and handing the same one to three separate native calls (video,
-    // audio, findClusters) isn't worth the risk of one of them detaching
-    // it out from under the others.
-    const audioInput =
-      this.audioSessionId >= 0 && this.audioSourceBuffer ? buf.slice(0) : undefined;
-    const clustersInput = buf.slice(0);
-    const subtitleInput = this.subtitleTrackMask > 0 ? buf.slice(0) : undefined;
-
-    const videoResult = splitRemuxResult(MkvDemuxModule.remuxChunk(this.videoSessionId, buf, offset));
-    const consumed = videoResult.bytesConsumed;
-    if (videoResult.muxed.byteLength > 0 && this.videoSourceBuffer) {
-      await this.enqueueAppend(this.videoSourceBuffer, 'video', videoResult.muxed);
-    }
-
-    // Audio is fed the same window and still appended whenever it produces
-    // something, but it is NOT allowed to gate `consumed` the way an
-    // earlier version did (`consumed = Math.min(videoConsumed,
-    // audioConsumed)`). That made video's progress hostage to audio's: if
-    // the audio remux session returned bytesConsumed === 0 for ANY reason —
-    // the session had gone invalid, native handed back its all-zero 8-byte
-    // header, or this particular window simply had no complete audio Blocks
-    // — `consumed` collapsed to 0, this function returned false, and
-    // (combined with startForwardLoop's old non-recovering stall handling)
-    // the forward loop died for good. Video had remuxed perfectly fine and
-    // still froze. Confirmed on-device as: turning on an audio track makes
-    // video stop playing entirely. A window where audio genuinely produced
-    // nothing isn't a failure worth reporting — it's just quiet for audio
-    // this time around — so it's silently skipped rather than thrown.
-    if (audioInput !== undefined && this.audioSourceBuffer) {
-      const audioResult = splitRemuxResult(MkvDemuxModule.remuxChunk(this.audioSessionId, audioInput, offset));
-      if (audioResult.muxed.byteLength > 0) {
-        this.audioAppendCount++;
-        this.audioAppendBytes += audioResult.muxed.byteLength;
-        // A failed audio append must not throw out of this function: video
-        // for this window is already appended, so a throw here (before
-        // nextFetchOffset advances below) made the next tick re-fetch the
-        // same window and remux its video a second time, duplicating it
-        // further along the timeline.
-        try {
-          await this.enqueueAppend(this.audioSourceBuffer, 'audio', audioResult.muxed);
-        } catch (e) {
-          if ((e as { name?: string })?.name === 'AbortError') throw e;
-        }
-      }
-    }
-
-    if (consumed === 0) return false;
-
-    // findClusters is unrelated to remuxing but cheap (no frame-level
-    // parsing, just Cluster boundaries) — calling it on the same bytes
-    // keeps the seek-timing index warm as a side effect of normal forward
-    // playback, not just during an explicit seek probe.
-    const parsed: MkvDemuxFindClustersResult = JSON.parse(MkvDemuxModule.findClusters(clustersInput, offset));
-    this.clusters.push(...parsed.clusters.filter(c => c.offset + c.size <= offset + consumed));
-
-    // Never let a subtitle-extraction failure block video/audio progress —
-    // this is exactly what let one malformed cue (a native jsonEscape bug,
-    // since fixed, that produced invalid JSON for any cue text containing a
-    // raw newline) wedge the ENTIRE forward loop: the throw happened before
-    // nextFetchOffset advanced below, so every subsequent tick re-fetched
-    // and re-crashed on the identical byte offset forever, freezing
-    // playback on whatever one frame had already been appended. Extraction
-    // is a nice-to-have; it must never be able to do that again, regardless
-    // of what specifically goes wrong inside it next time.
-    if (subtitleInput !== undefined) {
+  // An ended MediaSource (after endOfStream near the end of the file) must be
+  // reopened before its buffers accept anything. Writing timestampOffset is
+  // the one operation spec'd to do that without touching any data; it's 0
+  // throughout, since every sample already carries its real time.
+  private reopenIfEnded(): void {
+    if (this.mediaSource?.readyState !== 'ended') return;
+    for (const sb of [this.videoSourceBuffer, this.audioSourceBuffer]) {
       try {
-        this.extractEmbeddedCues(subtitleInput);
-      } catch (e) {
-        console.warn('MkvMseSession: embedded subtitle extraction failed, continuing without it —', e);
+        if (sb && !sb.updating) sb.timestampOffset = 0;
+      } catch {
+        // Not reopenable from here; the append will report it.
       }
     }
-
-    const newCursor = offset + consumed;
-    if (newCursor > this.nextFetchOffset) this.nextFetchOffset = newCursor;
-    return true;
+    this.reachedEof = false;
   }
 
-  private async fetchAndAppendNext(): Promise<'appended' | 'eof' | 'stalled'> {
-    const startOffset = this.nextFetchOffset;
-    if (this.fileSize !== undefined && startOffset >= this.fileSize) return 'eof';
-    let appended = await this.fetchAndAppendWindow(startOffset, CHUNK_SIZE);
-    if (!appended) {
-      // An unusually large single Cluster can exceed the normal chunk size
-      // — retry once with a much bigger window before giving up, rather
-      // than silently skipping data.
-      appended = await this.fetchAndAppendWindow(startOffset, CHUNK_SIZE * 6);
+  // Queued like any other operation, so it lands after appends already
+  // waiting (old-position data) and before the new position's appends —
+  // the ordering that keeps the parser from ever seeing time run backwards.
+  private resetParser(sb: SourceBuffer | null): void {
+    if (!sb) return;
+    const which = sb === this.videoSourceBuffer ? 'video' : 'audio';
+    this.enqueue(which, async () => {
+      this.reopenIfEnded();
+      try {
+        sb.abort();
+      } catch {
+        // Throws only when the MediaSource isn't open — nothing to reset.
+      }
+    }).catch(() => undefined);
+  }
+
+  private removeEnd(): number {
+    return this.durationSeconds > 0 ? this.durationSeconds + 1 : Number.MAX_SAFE_INTEGER;
+  }
+
+  // Drops buffered media far from the playhead: more than 30s behind it, or
+  // more than 150s ahead of it (old stretches left behind by seeking).
+  private evict(cur: number): void {
+    const lo = cur - BUFFER_KEEP_BEHIND_SEC;
+    const hi = cur + BUFFER_KEEP_AHEAD_MAX_SEC;
+    for (const [sb, which] of [
+      [this.videoSourceBuffer, 'video'],
+      [this.audioSourceBuffer, 'audio'],
+    ] as const) {
+      if (!sb || this.evicting[which]) continue;
+      const removals: Range[] = [];
+      for (const r of rangesOf(sb)) {
+        if (r.start < lo && Math.min(r.end, lo) - r.start >= EVICT_MIN_SEC) removals.push({ start: r.start, end: Math.min(r.end, lo) });
+        if (r.end > hi && r.end - Math.max(r.start, hi) >= EVICT_MIN_SEC) removals.push({ start: Math.max(r.start, hi), end: r.end });
+      }
+      if (removals.length === 0) continue;
+      this.evicting[which] = true;
+      Promise.all(removals.map(r => this.enqueueRemove(sb, which, r.start, r.end).catch(() => undefined))).then(() => {
+        this.evicting[which] = false;
+      });
     }
-    if (appended) return 'appended';
-    return this.fileSize !== undefined && startOffset + CHUNK_SIZE * 6 >= this.fileSize ? 'eof' : 'stalled';
   }
 
-  // ---- forward playback loop ----
+  // Ranges where both video and (if present) audio are buffered.
+  private playableRanges(): Range[] {
+    const video = rangesOf(this.videoSourceBuffer);
+    return this.audioSourceBuffer ? intersectRanges(video, rangesOf(this.audioSourceBuffer)) : video;
+  }
 
-  private startForwardLoop(): void {
-    const tick = async () => {
+  // ---- locating positions ------------------------------------------------------
+
+  private toSeconds(timecode: number): number {
+    return (timecode * this.timestampScale) / 1e9;
+  }
+
+  private keyframeAtOrBefore(t: number): Position | undefined {
+    const k = this.keyframes;
+    if (k.length === 0 || k[0].sec > t + RANGE_SLACK_SEC) return undefined;
+    let lo = 0;
+    let hi = k.length - 1;
+    while (lo < hi) {
+      const mid = Math.ceil((lo + hi) / 2);
+      if (k[mid].sec <= t) lo = mid;
+      else hi = mid - 1;
+    }
+    return k[lo];
+  }
+
+  // The nearest known Cluster at or before `t`, if one is close enough to be
+  // useful (within the seek tolerance); further back means it's just the
+  // last thing downloaded, not a landing point for `t`.
+  private knownClusterAtOrBefore(t: number): Position | undefined {
+    let best: Position | undefined;
+    for (const c of this.clusters.values()) {
+      const sec = this.toSeconds(c.timecode);
+      if (sec <= t && (!best || sec > best.sec)) best = { offset: c.offset, sec };
+    }
+    return best && t - best.sec <= SEEK_TOLERANCE_SEC ? best : undefined;
+  }
+
+  // Reads the Cues index in the background: a few KB to read the element's
+  // size, then the element itself. Until it arrives (or for a file without
+  // one) relocation uses the Cluster index and byte-offset search instead.
+  private async loadCues(): Promise<void> {
+    const init = this.initResult;
+    if (!init || init.cuesPosition < 0) return;
+    const at = init.segmentDataStart + init.cuesPosition;
+    try {
+      const head = await fetchRange(this.url, at, at + 65535, this.abort.signal);
+      const total = ebmlElementSize(new Uint8Array(head.buf));
+      if (total === undefined || total > MAX_CUES_BYTES) return;
+      const body = total <= head.buf.byteLength ? head : await fetchRange(this.url, at, at + total - 1, this.abort.signal);
       if (this.disposed) return;
-      // Overridden below when this tick hits a stall — everything else
-      // (nothing to fetch yet, a normal append, a caught error) reschedules
-      // at the regular cadence.
-      let nextDelay: number = FORWARD_LOOP_INTERVAL_MS;
-      if (!this.seekInProgress) {
-        try {
-          const cur = this.getCurrentTime();
-          this.logDiagnostics(cur);
-          if (this.reachedEof) {
-            // Parked at the end of the file: nothing left to fetch until a
-            // seek moves the cursor back (restartAt clears reachedEof). The
-            // loop keeps ticking rather than exiting, because an exited loop
-            // is exactly what froze playback on any rewind after reaching
-            // the end — the seek appended its one landing window and then
-            // nothing ever fetched past it.
-            nextDelay = FORWARD_LOOP_MAX_STALL_INTERVAL_MS;
-          } else if (this.bufferedAheadOf(cur) >= BUFFER_AHEAD_TARGET_SEC) {
-            // Buffer is healthy, so there is nothing to fetch this tick —
-            // and that is itself proof we are not stalled. Clearing the
-            // counter here is what makes it mean CONSECUTIVE stalls: without
-            // it the steady state (buffer full, no fetch attempted) never
-            // resets, so isolated transient stalls scattered across a whole
-            // movie would slowly accumulate and eventually trip the
-            // give-up ceiling on a perfectly healthy stream.
-            this.consecutiveStalls = 0;
-          } else {
-            const outcome = await this.fetchAndAppendNext();
-            if (outcome === 'eof') {
-              this.reachedEof = true;
-              try {
-                if (this.mediaSource?.readyState === 'open') this.mediaSource.endOfStream();
-              } catch {
-                // Already ended/closed.
-              }
-            }
-            if (outcome === 'stalled') {
-              // A stall used to `return` here — exiting the tick WITHOUT
-              // rescheduling the next setTimeout, which killed the forward
-              // loop forever after a single bad window. Any transient stall
-              // (slow range request, a window that happened to contain no
-              // complete Cluster, a hiccup right after a seek) then froze
-              // playback permanently with no recovery. Instead, keep
-              // retrying — but back off the retry interval as stalls pile
-              // up, so a source that's genuinely dead settles into slow,
-              // bounded polling instead of hammering the network in a tight
-              // loop.
-              //
-              // Even a long run of stalls no longer exits the loop — it only
-              // stops backing off further and polls at the ceiling, so a
-              // later seek (which moves the fetch cursor somewhere healthy)
-              // still has a loop to hand off to.
-              this.consecutiveStalls++;
-              if (this.consecutiveStalls === MAX_CONSECUTIVE_STALLS) {
-                console.warn(
-                  `MkvMseSession: ${this.consecutiveStalls} consecutive stalled windows, polling slowly from here`,
-                );
-              }
-              nextDelay = Math.min(
-                FORWARD_LOOP_INTERVAL_MS * (this.consecutiveStalls + 1),
-                FORWARD_LOOP_MAX_STALL_INTERVAL_MS,
-              );
-            } else if (outcome === 'appended') {
-              this.consecutiveStalls = 0;
-            }
-          }
-          this.trimBehind(cur);
-        } catch (e) {
-          // A seek deliberately aborts whatever this loop had in flight for
-          // the position being left behind, so an AbortError here is the
-          // system working, not a fault worth reporting.
-          if ((e as { name?: string })?.name !== 'AbortError') {
-            console.warn('MkvMseSession: forward loop error —', e);
-          }
-        }
-      }
-      if (!this.disposed) this.forwardLoopHandle = setTimeout(tick, nextDelay);
-    };
-    this.forwardLoopHandle = setTimeout(tick, FORWARD_LOOP_INTERVAL_MS);
+      const parsed: { points?: [number, number, number][] } = JSON.parse(MkvDemuxModule.parseCues(body.buf));
+      const points = (parsed.points ?? [])
+        .filter(([, track]) => track === init.videoTrackNumber)
+        .map(([time, , cluster]) => ({ sec: this.toSeconds(time), offset: init.segmentDataStart + cluster }))
+        .sort((a, b) => a.sec - b.sec);
+      this.keyframes = points;
+      console.warn(`MkvMseSession: seek index loaded, ${points.length} keyframes`);
+    } catch (e) {
+      if ((e as { name?: string })?.name !== 'AbortError') console.warn('MkvMseSession: could not load seek index —', e);
+    }
   }
 
-  // Periodic one-line state dump at WARN level. The device throttles an app
-  // that logs more than ~300 lines/s by dropping its INFO lines for 16s at a
-  // time — and the media stack alone logs that much during playback — so
-  // INFO-level logging from here routinely vanishes exactly when it's
-  // needed. WARN survives the throttle.
+  // Byte-offset search for files without a Cues index: estimate from the
+  // target's share of the duration, probe for a Cluster there, and narrow
+  // in by interpolating between the closest probes on either side (bitrate
+  // varies too much across a file for one global estimate to land well).
+  private async findLandingOffset(target: number, stale: () => boolean): Promise<Position | undefined> {
+    const known = this.knownClusterAtOrBefore(target);
+    if (known) return known;
+    if (!(this.durationSeconds > 0) || this.fileSize === undefined) return undefined;
+    let lowOffset = this.initSegmentEnd;
+    let lowSec = 0;
+    let highOffset = this.fileSize;
+    let highSec = this.durationSeconds;
+    const span = this.fileSize - this.initSegmentEnd;
+    let estOffset = Math.round(this.initSegmentEnd + Math.max(0, Math.min(1, target / this.durationSeconds)) * span);
+    for (let i = 0; i < MAX_SEEK_ESTIMATE_ITERATIONS; i++) {
+      let probe = await this.probeAt(estOffset);
+      if (stale()) return undefined;
+      if (!probe) {
+        probe = await this.probeAt(estOffset, SEEK_PROBE_CHUNK * 6);
+        if (stale() || !probe) return undefined;
+      }
+      if (Math.abs(target - probe.sec) < SEEK_TOLERANCE_SEC && probe.sec <= target + 0.5) return probe;
+      if (probe.sec <= target) {
+        lowOffset = probe.offset;
+        lowSec = probe.sec;
+      } else {
+        highOffset = probe.offset;
+        highSec = probe.sec;
+      }
+      estOffset =
+        highSec > lowSec ? Math.round(lowOffset + ((target - lowSec) * (highOffset - lowOffset)) / (highSec - lowSec)) : lowOffset;
+      estOffset = Math.max(this.initSegmentEnd, Math.min(this.fileSize - 1, estOffset));
+    }
+    // Didn't converge within tolerance: the closest probe at or before the
+    // target is still a valid place to start.
+    return lowSec > 0 ? { offset: lowOffset, sec: lowSec } : undefined;
+  }
+
+  private async probeAt(offset: number, size: number = SEEK_PROBE_CHUNK): Promise<Position | undefined> {
+    const start = Math.max(this.initSegmentEnd, Math.floor(offset));
+    const end = Math.min(start + size, this.fileSize ?? Number.MAX_SAFE_INTEGER) - 1;
+    const { buf } = await this.fetchBytes(start, end);
+    if (buf.byteLength === 0) return undefined;
+    const parsed: MkvDemuxFindClustersResult = JSON.parse(MkvDemuxModule.findClusters(buf, start));
+    if (parsed.clusters.length === 0) return undefined;
+    for (const cl of parsed.clusters) this.clusters.set(cl.offset, cl);
+    const first = parsed.clusters[0];
+    return { offset: first.offset, sec: this.toSeconds(first.timecode) };
+  }
+
+  // ---- init segment --------------------------------------------------------------
+
+  private async fetchInitSegment(): Promise<MkvDemuxInitResult | undefined> {
+    let fetchSize = INIT_FETCH_START;
+    while (fetchSize <= INIT_FETCH_MAX) {
+      const { buf, total } = await fetchRange(this.url, 0, fetchSize - 1, this.abort.signal);
+      if (total !== undefined) this.fileSize = total;
+      // Read before handing `buf` to native, which may detach it.
+      const fetchedLength = buf.byteLength;
+      const result: MkvDemuxInitResult = JSON.parse(MkvDemuxModule.parseInitSegment(buf));
+      if (result.ok) return result;
+      // A server that ignores Range (or a tiny file) returns fewer bytes than
+      // asked for — growing the window would just refetch the same bytes.
+      if (fetchedLength < fetchSize) return undefined;
+      fetchSize *= 4;
+    }
+    return undefined;
+  }
+
+  // ---- diagnostics -----------------------------------------------------------------
+
+  // One line every 5s at WARN level: the device throttles an app's INFO
+  // logging during playback, WARN survives it.
   private logDiagnostics(cur: number): void {
     const now = Date.now();
     if (now - this.lastDiagnosticsAt < 5000) return;
@@ -1197,81 +1167,9 @@ export class MkvMseSession {
     console.warn(
       `MkvMseSession: t=${cur.toFixed(1)} ms=${this.mediaSource?.readyState} video=[${describeRanges(
         this.videoSourceBuffer,
-      )}] audio=[${describeRanges(this.audioSourceBuffer)}] audioSession=${this.audioSessionId} audioAppends=${
-        this.audioAppendCount
-      }/${this.audioAppendBytes}B next=${this.nextFetchOffset} eof=${this.reachedEof} stalls=${
-        this.consecutiveStalls
-      } subs=${this.activeSubtitleTrack ?? '-'}:${this.getEmbeddedSubtitleCues().length}`,
+      )}] audio=[${describeRanges(this.audioSourceBuffer)}] cursor=${this.cursor?.offset ?? '-'}@${
+        this.cursor?.sec.toFixed(1) ?? '-'
+      } keyframes=${this.keyframes.length} stalls=${this.consecutiveStalls}`,
     );
-  }
-
-  private bufferedAheadOf(cur: number): number {
-    const b = this.videoSourceBuffer?.buffered;
-    if (!b) return 0;
-    for (let i = 0; i < b.length; i++) {
-      if (cur >= b.start(i) && cur <= b.end(i)) return b.end(i) - cur;
-    }
-    return 0;
-  }
-
-  private trimBehind(cur: number): void {
-    const cutoff = cur - BUFFER_KEEP_BEHIND_SEC;
-    if (cutoff <= this.lastTrimAt + 10) return; // avoid spamming remove() for tiny increments
-    for (const sb of [this.videoSourceBuffer, this.audioSourceBuffer]) {
-      if (!sb || sb.updating) continue;
-      try {
-        sb.remove(0, cutoff);
-      } catch {
-        // Not fatal — the buffer just holds more than intended.
-      }
-    }
-    this.lastTrimAt = cutoff;
-  }
-
-  // ---- seeking ----
-
-  private toSeconds(timecode: number): number {
-    return (timecode * this.timestampScale) / 1e9;
-  }
-
-  private isBuffered(t: number): boolean {
-    const b = this.videoSourceBuffer?.buffered;
-    if (!b) return false;
-    for (let i = 0; i < b.length; i++) {
-      if (t >= b.start(i) && t <= b.end(i)) return true;
-    }
-    return false;
-  }
-
-  private findNearestKnownCluster(targetSeconds: number): { offset: number; sec: number } | undefined {
-    let best: { offset: number; sec: number } | undefined;
-    for (const c of this.clusters) {
-      const sec = this.toSeconds(c.timecode);
-      if (sec <= targetSeconds && (!best || sec > best.sec)) best = { offset: c.offset, sec };
-    }
-    return best;
-  }
-
-  private estimateByteOffset(targetSeconds: number): number {
-    if (this.fileSize === undefined) return this.nextFetchOffset;
-    const span = this.fileSize - this.initSegmentEnd;
-    const frac = Math.max(0, Math.min(1, targetSeconds / this.durationSeconds));
-    return Math.round(this.initSegmentEnd + frac * span);
-  }
-
-  private async probeAt(
-    offset: number,
-    size: number = SEEK_PROBE_CHUNK,
-  ): Promise<{ offset: number; timecodeSec: number } | undefined> {
-    const clamped = Math.max(this.initSegmentEnd, Math.floor(offset));
-    const end = this.fileSize !== undefined ? Math.min(clamped + size, this.fileSize) - 1 : clamped + size - 1;
-    const { buf, total } = await fetchRange(this.url, clamped, end, this.epochAbort.signal);
-    if (total !== undefined) this.fileSize = total;
-    if (buf.byteLength === 0) return undefined;
-    const parsed: MkvDemuxFindClustersResult = JSON.parse(MkvDemuxModule.findClusters(buf, clamped));
-    if (parsed.clusters.length === 0) return undefined;
-    this.clusters.push(...parsed.clusters);
-    const first = parsed.clusters[0];
-    return { offset: first.offset, timecodeSec: this.toSeconds(first.timecode) };
   }
 }

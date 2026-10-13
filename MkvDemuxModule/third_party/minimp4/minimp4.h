@@ -497,6 +497,20 @@ int MP4E_close(MP4E_mux_t *mux);
 int MP4E_set_dsi(MP4E_mux_t *mux, int track_id, const void *dsi, int bytes);
 
 /**
+*   PATCH (StremioVega/MkvDemuxModule): set the decode time, in the track's
+*   timescale, that the next fragment's tfdt carries; later fragments carry
+*   on from it. Lets a caller anchor a track to the real timestamp of its
+*   first sample rather than always starting at zero. Fragmentation mode only.
+*/
+void MP4E_set_next_decode_time(MP4E_mux_t *mux, int track_id, uint64_t decode_time);
+
+/**
+*   PATCH (StremioVega/MkvDemuxModule): the decode time the next fragment will
+*   carry, i.e. where the track's running clock currently stands.
+*/
+uint64_t MP4E_get_next_decode_time(MP4E_mux_t *mux, int track_id);
+
+/**
 *   Set VPS data. MUST be used for HEVC (H.265) track.
 *
 *   return error code MP4E_STATUS_*
@@ -993,6 +1007,18 @@ int MP4E_set_dsi(MP4E_mux_t *mux, int track_id, const void *dsi, int bytes)
     if (tr->vsps.bytes)
         return MP4E_STATUS_ONLY_ONE_DSI_ALLOWED;   // only one DSI allowed
     return append_mem(&tr->vsps, dsi, bytes) ? MP4E_STATUS_OK : MP4E_STATUS_NO_MEMORY;
+}
+
+void MP4E_set_next_decode_time(MP4E_mux_t *mux, int track_id, uint64_t decode_time)
+{
+    track_t* tr = ((track_t*)mux->tracks.data) + track_id;
+    tr->fragment_decode_time = decode_time;
+}
+
+uint64_t MP4E_get_next_decode_time(MP4E_mux_t *mux, int track_id)
+{
+    track_t* tr = ((track_t*)mux->tracks.data) + track_id;
+    return tr->fragment_decode_time;
 }
 
 int MP4E_set_vps(MP4E_mux_t *mux, int track_id, const void *vps, int bytes)

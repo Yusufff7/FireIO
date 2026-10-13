@@ -95,6 +95,14 @@ std::string extractTextCues(const uint8_t* data, size_t size, uint64_t trackNumb
 
 // Same, for every track whose bit is set in `trackMask` (bit N = Matroska
 // track N) in one pass; with `tagTrack`, each cue carries a "track" field.
+// The Cues index (time -> keyframe Cluster position), from a buffer that
+// starts at the Cues element. Returns JSON:
+//   {"complete":bool,"points":[[cueTimeTicks, trackNumber, clusterPosition],...]}
+// clusterPosition is relative to the Segment payload start, which
+// parseInitSegment reports as "segmentDataStart" alongside "cuesPosition"
+// (also relative; -1 when the file has no Cues).
+std::string parseCues(const uint8_t* data, size_t size);
+
 std::string extractTextCuesForTracks(const uint8_t* data, size_t size, uint64_t trackMask, bool isAss, bool tagTrack);
 
 } // namespace MkvDemuxCore

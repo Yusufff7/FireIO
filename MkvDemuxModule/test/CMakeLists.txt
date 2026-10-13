@@ -100,3 +100,15 @@ target_include_directories(subs_probe PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/minimp4
 )
 target_link_libraries(subs_probe PRIVATE matroska ebml Threads::Threads)
+
+add_executable(cues_probe
+  cues_probe.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/../kepler/turbo-modules/MkvDemuxCore.cpp
+)
+target_include_directories(cues_probe PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../kepler/turbo-modules
+  ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/libebml/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/libmatroska/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/minimp4
+)
+target_link_libraries(cues_probe PRIVATE matroska ebml Threads::Threads)

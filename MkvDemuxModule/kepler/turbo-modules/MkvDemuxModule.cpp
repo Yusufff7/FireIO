@@ -58,4 +58,8 @@ std::string MkvDemuxModule::extractTextCues(ArrayBuffer chunk, double trackNumbe
   return MkvDemuxCore::extractTextCues(chunk.data(), chunk.size(), static_cast<uint64_t>(trackNumber), isAss);
 }
 
+std::string MkvDemuxModule::parseCues(ArrayBuffer chunk) {
+  return MkvDemuxCore::parseCues(chunk.data(), chunk.size());
+}
+
 } // namespace MkvDemuxModuleTurboModule

@@ -20,6 +20,8 @@
 #define MINIMP4_IMPLEMENTATION
 #include "../../third_party/minimp4/minimp4.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -313,6 +315,123 @@ EbmlElement* walkChildren(EbmlStream& stream, EbmlElement& parent, int& upperOut
   }
   upperOut = upper > 0 ? upper - 1 : 0;
   return child;
+}
+
+// ---- Raw EBML reading ---------------------------------------------------
+//
+// A minimal byte-level reader for the two jobs where it is simpler and
+// sturdier than libebml's incremental element search: finding the Cues
+// index through the SeekHead, and reading the Cues index itself. Both are
+// small, fully-buffered, fixed-shape structures, so a plain walk over
+// [ID][size][payload] triples is all they need — and it can't lose its place
+// the way the incremental search can after an edited header (see
+// parseInitSegment's raw first-Cluster scan).
+
+constexpr uint64_t kIdEbml = 0x1A45DFA3;
+constexpr uint64_t kIdSegment = 0x18538067;
+constexpr uint64_t kIdSeekHead = 0x114D9B74;
+constexpr uint64_t kIdSeek = 0x4DBB;
+constexpr uint64_t kIdSeekId = 0x53AB;
+constexpr uint64_t kIdSeekPosition = 0x53AC;
+constexpr uint64_t kIdCues = 0x1C53BB6B;
+constexpr uint64_t kIdCuePoint = 0xBB;
+constexpr uint64_t kIdCueTime = 0xB3;
+constexpr uint64_t kIdCueTrackPositions = 0xB7;
+constexpr uint64_t kIdCueTrack = 0xF7;
+constexpr uint64_t kIdCueClusterPosition = 0xF1;
+constexpr uint64_t kIdCluster = 0x1F43B675;
+
+struct RawElement {
+  uint64_t id = 0;
+  uint64_t dataStart = 0;
+  uint64_t dataEnd = 0; // UINT64_MAX when the size is "unknown"
+  bool unknownSize = false;
+};
+
+// Reads the element header at `pos`. The ID keeps its length-marker bits
+// (that's how Matroska IDs are written down); the size has them stripped.
+bool readRawElement(const uint8_t* data, size_t size, uint64_t pos, RawElement& out) {
+  if (pos >= size) return false;
+  int idLen = 0;
+  for (int i = 0; i < 4; i++) {
+    if (data[pos] & (0x80 >> i)) {
+      idLen = i + 1;
+      break;
+    }
+  }
+  if (idLen == 0 || pos + idLen > size) return false;
+  uint64_t id = 0;
+  for (int i = 0; i < idLen; i++) id = (id << 8) | data[pos + i];
+  const uint64_t p = pos + idLen;
+  if (p >= size) return false;
+  int sizeLen = 0;
+  for (int i = 0; i < 8; i++) {
+    if (data[p] & (0x80 >> i)) {
+      sizeLen = i + 1;
+      break;
+    }
+  }
+  if (sizeLen == 0 || p + sizeLen > size) return false;
+  const uint8_t firstMask = static_cast<uint8_t>(0xFF >> sizeLen);
+  uint64_t value = data[p] & firstMask;
+  bool allOnes = value == firstMask;
+  for (int i = 1; i < sizeLen; i++) {
+    value = (value << 8) | data[p + i];
+    if (data[p + i] != 0xFF) allOnes = false;
+  }
+  out.id = id;
+  out.dataStart = p + sizeLen;
+  out.unknownSize = allOnes;
+  out.dataEnd = allOnes ? UINT64_MAX : out.dataStart + value;
+  return true;
+}
+
+uint64_t readRawUint(const uint8_t* data, uint64_t start, uint64_t end) {
+  uint64_t v = 0;
+  for (uint64_t i = start; i < end && i - start < 8; i++) v = (v << 8) | data[i];
+  return v;
+}
+
+// Where the Segment's payload begins (every SeekHead/Cues position is
+// relative to it) and where the Cues index is, relative to that — or -1
+// when the file has none or doesn't say. Read from the SeekHead, the
+// file's table of contents; Cues written before the media (rare) are
+// found directly.
+void locateCues(const uint8_t* data, size_t size, uint64_t& segmentDataStart, int64_t& cuesPosition) {
+  segmentDataStart = 0;
+  cuesPosition = -1;
+  RawElement e;
+  if (!readRawElement(data, size, 0, e) || e.id != kIdEbml || e.unknownSize) return;
+  RawElement seg;
+  if (!readRawElement(data, size, e.dataEnd, seg) || seg.id != kIdSegment) return;
+  segmentDataStart = seg.dataStart;
+  uint64_t pos = seg.dataStart;
+  while (readRawElement(data, size, pos, e)) {
+    if (e.id == kIdCluster) break; // the header is over
+    if (e.id == kIdCues) {
+      if (cuesPosition < 0) cuesPosition = static_cast<int64_t>(pos - segmentDataStart);
+      break;
+    }
+    if (e.id == kIdSeekHead && !e.unknownSize && e.dataEnd <= size) {
+      RawElement seek;
+      for (uint64_t q = e.dataStart; q < e.dataEnd && readRawElement(data, size, q, seek) && !seek.unknownSize;
+           q = seek.dataEnd) {
+        if (seek.id != kIdSeek || seek.dataEnd > e.dataEnd) continue;
+        uint64_t seekId = 0;
+        int64_t seekPos = -1;
+        RawElement f;
+        for (uint64_t r = seek.dataStart; r < seek.dataEnd && readRawElement(data, size, r, f) && !f.unknownSize;
+             r = f.dataEnd) {
+          if (f.dataEnd > seek.dataEnd) break;
+          if (f.id == kIdSeekId) seekId = readRawUint(data, f.dataStart, f.dataEnd);
+          else if (f.id == kIdSeekPosition) seekPos = static_cast<int64_t>(readRawUint(data, f.dataStart, f.dataEnd));
+        }
+        if (seekId == kIdCues && seekPos >= 0 && cuesPosition < 0) cuesPosition = seekPos;
+      }
+    }
+    if (e.unknownSize) break;
+    pos = e.dataEnd;
+  }
 }
 
 } // namespace
@@ -626,15 +745,33 @@ std::string parseInitSegment(const uint8_t* data, size_t size) {
       return initErrorJson("no Cluster within supplied bytes — caller must fetch further into the file");
     }
 
+    // Where the media data actually starts: the file's first Cluster. The
+    // element walk above normally stops right on it, but a header edited in
+    // place — mkvpropedit grows elements and pads the difference with Void,
+    // a routine fix-up by release groups — can leave the walk unable to
+    // resync until a LATER Cluster, which silently dropped the whole first
+    // Cluster from playback (reproduced offline: the first second of video
+    // and audio missing, and the picture starting mid-GOP). A raw scan for
+    // the Cluster ID can't be misled that way. Erring early is harmless:
+    // every consumer of this offset scans forward for Clusters itself.
+    const size_t rawFirstCluster = findClusterIdOffset(data, size, 0);
+    if (rawFirstCluster < initEnd) initEnd = rawFirstCluster;
+
     // Duration is expressed in Segment Ticks (timestampScale units), same
     // convention as Cluster/Block timecodes — converting to seconds here
     // rather than handing the caller raw ticks plus a scale to multiply
     // themselves, since every other JSON field is already caller-ready.
     const double durationSeconds = durationTicks * (static_cast<double>(timestampScale) / 1e9);
 
+    uint64_t segmentDataStart = 0;
+    int64_t cuesPosition = -1;
+    locateCues(data, size, segmentDataStart, cuesPosition);
+
     std::ostringstream out;
     out << "{\"ok\":true"
         << ",\"initSegmentEnd\":" << initEnd
+        << ",\"segmentDataStart\":" << segmentDataStart
+        << ",\"cuesPosition\":" << cuesPosition
         << ",\"timestampScale\":" << timestampScale
         << ",\"durationSeconds\":" << durationSeconds
         << ",\"videoCodec\":\"" << jsonEscape(videoCodec) << "\""
@@ -1307,6 +1444,41 @@ struct RemuxSession {
   uint64_t lastProcessedEndOffset = 0;
   bool hasProcessedAny = false;
   bool waitingForKeyframe = false;
+
+  // Timeline anchoring. A session's output timeline is relative to the
+  // first Cluster it reads (`baseTimecode`, in Segment timestamp units) —
+  // which is exactly the time the caller declares with timestampOffset
+  // (see mkvMse.ts's restartAt). Each track's first sample is placed at its
+  // own real time relative to that base rather than at zero. That matters
+  // for video after a seek: frames before the first keyframe are dropped
+  // (see waitingForKeyframe), often several seconds of them, and labelling
+  // the keyframe as time zero put the picture that many seconds ahead of
+  // the audio and the subtitles.
+  bool haveBaseTimecode = false;
+  uint64_t baseTimecode = 0;
+  bool anchored = false;
+  // Video frame duration in exact (fractional) timescale units, accumulated
+  // so per-frame durations round without drifting: a fixed rounded duration
+  // (e.g. 3754 for 23.976fps at 90kHz, really 3753.75) drifted the picture
+  // about 0.1s every 24 minutes.
+  double exactDurationUnits = 0;
+  double durationAccumulator = 0;
+
+  // Drift lock. Durations alone (a constant per-frame duration for video,
+  // the codec's frame size for audio) are only as good as the numbers they
+  // come from, and any error accumulates for as long as a session runs:
+  // measured on-device at ~0.8% between video and audio, over a second of
+  // lip-sync error a few minutes after a seek. So both tracks are checked
+  // against the container's own timestamps as they go — audio every sample,
+  // video at every keyframe — and pulled back when they stray.
+  //
+  // Video: where the last keyframe was (in timescale units relative to the
+  // base) and how many frames have been written since, which gives the
+  // true frame duration; plus any excess still to be trimmed off upcoming
+  // frames when video has run long (it can't jump backwards).
+  double lastKeyframeUnits = -1;
+  uint64_t framesSinceKeyframe = 0;
+  double pendingTrimUnits = 0;
 };
 
 std::mutex g_sessionsMutex;
@@ -1368,6 +1540,12 @@ int openRemuxSession(const std::string& codecId, const uint8_t* codecPrivateData
   // arrives. At the start of the file that's free: the first frame IS a
   // keyframe, so it's accepted immediately and nothing is lost.
   session.waitingForKeyframe = session.isVideo;
+  // One absolute timeline for the whole playback: every sample is placed at
+  // its real media time (base 0), so output from anywhere in the file lands
+  // in the right place in the player's buffer and the caller never needs a
+  // timestampOffset. See the discontinuity handling in remuxChunk.
+  session.haveBaseTimecode = true;
+  session.baseTimecode = 0;
 
   const auto fail = [&]() {
     g_sessions.erase(id);
@@ -1377,6 +1555,7 @@ int openRemuxSession(const std::string& codecId, const uint8_t* codecPrivateData
   if (session.isVideo && videoDefaultDurationNs > 0) {
     const double units = (static_cast<double>(videoDefaultDurationNs) / 1e9) * static_cast<double>(session.mp4TimeScale);
     session.fixedDurationUnits = static_cast<uint32_t>(units + 0.5);
+    session.exactDurationUnits = units;
   } else if (session.isVideo) {
     // No KaxTrackDefaultDuration to anchor a constant duration on — the
     // fixed-duration approach needs SOME per-frame duration to use, so
@@ -1513,12 +1692,19 @@ std::vector<uint8_t> remuxChunk(int sessionId, const uint8_t* data, size_t size,
     session = &it->second;
   }
 
-  if (session->isVideo) {
-    if (session->hasProcessedAny && baseOffset != session->lastProcessedEndOffset) {
-      session->waitingForKeyframe = true;
-    }
-    session->hasProcessedAny = true;
+  // A jump in the byte offset (a seek, or the caller relocating its fetch
+  // cursor) means the next samples aren't a continuation of the last ones.
+  // Video must wait for a keyframe (see waitingForKeyframe), and every track
+  // re-anchors its clock on the first sample it writes after the jump, so
+  // it lands at its real time rather than straight after the previous one.
+  if (session->hasProcessedAny && baseOffset != session->lastProcessedEndOffset) {
+    if (session->isVideo) session->waitingForKeyframe = true;
+    session->anchored = false;
+    session->lastKeyframeUnits = -1;
+    session->framesSinceKeyframe = 0;
+    session->pendingTrimUnits = 0;
   }
+  session->hasProcessedAny = true;
 
   uint64_t bytesConsumed = 0;
   try {
@@ -1570,7 +1756,9 @@ std::vector<uint8_t> remuxChunk(int sessionId, const uint8_t* data, size_t size,
       // onLeaf callback returns, so nothing can hold a reference/pointer
       // to it past that point; copying out just the bytes actually
       // needed sidesteps that lifetime entirely instead of fighting it.
-      auto handleBlock = [&](uint16_t trackNum, bool keyframe, const uint8_t* frameData, size_t frameSize) {
+      uint64_t clusterTimecode = 0;
+      auto handleBlock = [&](uint16_t trackNum, bool keyframe, int16_t relativeTimecode, unsigned laceIndex,
+                             const uint8_t* frameData, size_t frameSize) {
         if (trackNum != session->matroskaTrackNumber) return;
         if (session->waitingForKeyframe) {
           // Dropping frames here, not just skipping the mux call — a
@@ -1622,11 +1810,80 @@ std::vector<uint8_t> remuxChunk(int sessionId, const uint8_t* data, size_t size,
           if (!parsed) return;
           session->needsBsiFromFirstFrame = false;
         }
+        // This sample's real time per the container, in timescale units
+        // relative to the base. Negative is possible (B-frames just before
+        // the base); it's only ever compared, never written, when negative.
+        const int64_t ticks = static_cast<int64_t>(clusterTimecode) + relativeTimecode -
+            static_cast<int64_t>(session->baseTimecode);
+        const double realUnits = static_cast<double>(ticks) * static_cast<double>(session->timestampScaleNs) / 1e9 *
+            static_cast<double>(session->mp4TimeScale);
+
         uint32_t durationUnits = session->fixedDurationUnits;
         if (session->kind == RemuxKind::TrueHd) {
           const uint32_t units = trueHdAccessUnitCount(frameData, frameSize);
           if (units == 0) return; // malformed/truncated — drop rather than mis-time the track
           durationUnits = units * session->fixedDurationUnits;
+        }
+
+        if (!session->anchored) {
+          // First sample this session will write: place it at its real time
+          // relative to the base (never before it).
+          MP4E_set_next_decode_time(session->mux, session->mp4TrackId,
+              realUnits > 0 ? static_cast<uint64_t>(realUnits + 0.5) : 0);
+          session->anchored = true;
+          if (session->isVideo) session->lastKeyframeUnits = realUnits > 0 ? realUnits : 0;
+        } else if (!session->isVideo) {
+          // Audio: every sample. Frames laced into one Block share its
+          // timestamp, so the Nth is N frame durations after it. Matroska
+          // timestamps are millisecond-precise and audio frames are 20-32ms,
+          // so only a deviation over a whole frame is treated as drift.
+          const double expected = realUnits + static_cast<double>(laceIndex) * durationUnits;
+          const double clock = static_cast<double>(MP4E_get_next_decode_time(session->mux, session->mp4TrackId));
+          if (expected > 0 && std::fabs(expected - clock) > durationUnits) {
+            MP4E_set_next_decode_time(session->mux, session->mp4TrackId, static_cast<uint64_t>(expected + 0.5));
+          }
+        } else if (keyframe && laceIndex == 0) {
+          // Video: at each keyframe. First re-measure the true frame
+          // duration from the keyframe spacing — a declared frame rate can be
+          // rounded or simply wrong — then compare the running clock with
+          // this keyframe's real time.
+          if (session->lastKeyframeUnits >= 0 && session->framesSinceKeyframe > 0 && realUnits > session->lastKeyframeUnits) {
+            const double measured = (realUnits - session->lastKeyframeUnits) / static_cast<double>(session->framesSinceKeyframe);
+            const double relative = std::fabs(measured - session->exactDurationUnits) / session->exactDurationUnits;
+            if (session->exactDurationUnits > 0 && relative > 0.0005 && relative < 0.1) session->exactDurationUnits = measured;
+          }
+          session->lastKeyframeUnits = realUnits;
+          session->framesSinceKeyframe = 0;
+          const double clock = static_cast<double>(MP4E_get_next_decode_time(session->mux, session->mp4TrackId));
+          const double half = session->exactDurationUnits / 2;
+          if (realUnits > clock + half) {
+            // Behind: jump ahead to it (a gap under one keyframe interval's
+            // worth of drift, which the player bridges).
+            MP4E_set_next_decode_time(session->mux, session->mp4TrackId, static_cast<uint64_t>(realUnits + 0.5));
+            session->pendingTrimUnits = 0;
+          } else if (clock > realUnits + half) {
+            // Ahead: the clock can't go backwards, so trim the excess off the
+            // coming frames instead (see below).
+            session->pendingTrimUnits = clock - realUnits;
+          } else {
+            session->pendingTrimUnits = 0;
+          }
+        }
+
+        if (session->isVideo && session->exactDurationUnits > 0) {
+          const double next = session->durationAccumulator + session->exactDurationUnits;
+          durationUnits = static_cast<uint32_t>(static_cast<uint64_t>(next + 0.5) -
+              static_cast<uint64_t>(session->durationAccumulator + 0.5));
+          session->durationAccumulator = next;
+          // Bleed off any excess by at most 10% of a frame per frame, so the
+          // correction is invisible rather than a skip.
+          if (session->pendingTrimUnits > 0 && durationUnits > 1) {
+            const uint32_t trim = static_cast<uint32_t>(
+                std::min(session->pendingTrimUnits, std::max(1.0, durationUnits * 0.1)));
+            durationUnits -= std::min(trim, durationUnits - 1);
+            session->pendingTrimUnits -= trim;
+          }
+          session->framesSinceKeyframe++;
         }
         session->samplesWritten++;
         MP4E_put_sample(session->mux, 0, frameData, static_cast<int>(frameSize),
@@ -1638,6 +1895,11 @@ std::vector<uint8_t> remuxChunk(int sessionId, const uint8_t* data, size_t size,
       while (ce != nullptr && upper <= 0) {
         if (auto* tc = dynamic_cast<KaxClusterTimestamp*>(ce)) {
           tc->ReadData(stream.I_O()); // ReadData alone fully consumes it — no SkipData call needed or correct here
+          clusterTimecode = tc->GetValue();
+          if (!session->haveBaseTimecode) {
+            session->baseTimecode = clusterTimecode;
+            session->haveBaseTimecode = true;
+          }
         } else if (auto* sb = dynamic_cast<KaxSimpleBlock*>(ce)) {
           sb->ReadData(stream.I_O());
           // A Block can be "laced" — several frames packed into one Block
@@ -1650,9 +1912,10 @@ std::vector<uint8_t> remuxChunk(int sessionId, const uint8_t* data, size_t size,
           // dropped virtually all audio on any real-world laced AAC track.
           const uint16_t trackNum = sb->TrackNum();
           const bool keyframe = sb->IsKeyframe();
+          const int16_t relative = sb->GetRelativeTimestamp();
           for (unsigned i = 0; i < sb->NumberFrames(); ++i) {
             DataBuffer& buf = sb->GetBuffer(i);
-            handleBlock(trackNum, keyframe, buf.Buffer(), buf.Size());
+            handleBlock(trackNum, keyframe, relative, i, buf.Buffer(), buf.Size());
           }
         } else if (auto* bg = dynamic_cast<KaxBlockGroup*>(ce)) {
           // A significant fraction of real encodes (confirmed against this
@@ -1668,6 +1931,7 @@ std::vector<uint8_t> remuxChunk(int sessionId, const uint8_t* data, size_t size,
           // TrackVideo's children.
           bool hasReference = false;
           uint16_t blockTrackNum = 0;
+          int16_t blockRelative = 0;
           // Frame bytes copied out (not held as pointers) inside the
           // walkChildren callback below, since it deletes the KaxBlock the
           // instant the callback returns — see handleBlock's comment.
@@ -1677,6 +1941,7 @@ std::vector<uint8_t> remuxChunk(int sessionId, const uint8_t* data, size_t size,
             if (auto* b = dynamic_cast<KaxBlock*>(&bc)) {
               b->ReadData(stream.I_O());
               blockTrackNum = b->TrackNum();
+              blockRelative = b->GetRelativeTimestamp();
               blockFrames.reserve(b->NumberFrames());
               for (unsigned i = 0; i < b->NumberFrames(); ++i) {
                 DataBuffer& buf = b->GetBuffer(i);
@@ -1692,7 +1957,8 @@ std::vector<uint8_t> remuxChunk(int sessionId, const uint8_t* data, size_t size,
               bc.SkipData(stream, EBML_CONTEXT(&bc));
             }
           });
-          for (auto& frame : blockFrames) handleBlock(blockTrackNum, !hasReference, frame.data(), frame.size());
+          for (unsigned i = 0; i < blockFrames.size(); ++i)
+            handleBlock(blockTrackNum, !hasReference, blockRelative, i, blockFrames[i].data(), blockFrames[i].size());
           delete ce;
           ce = next;
           upper = bgUpper;
@@ -1714,7 +1980,7 @@ std::vector<uint8_t> remuxChunk(int sessionId, const uint8_t* data, size_t size,
   } catch (...) {
   }
 
-  if (session->isVideo && bytesConsumed > 0) session->lastProcessedEndOffset = baseOffset + bytesConsumed;
+  if (bytesConsumed > 0) session->lastProcessedEndOffset = baseOffset + bytesConsumed;
 
   std::vector<uint8_t> out(8 + session->outputBuffer.size());
   std::memcpy(out.data(), &bytesConsumed, 8);
@@ -1785,6 +2051,59 @@ std::string extractAssDialogueText(const std::string& payload) {
 // converting those.
 std::string extractTextCues(const uint8_t* data, size_t size, uint64_t trackNumber, bool isAss) {
   return extractTextCuesForTracks(data, size, trackNumber < 64 ? (uint64_t{1} << trackNumber) : 0, isAss, false);
+}
+
+// The Cues index as [CueTime ticks, track number, Cluster position relative
+// to the Segment payload] triples, from a buffer starting at the Cues
+// element. "complete" is false when the buffer cut the element short (the
+// points up to the cut are still returned).
+std::string parseCues(const uint8_t* data, size_t size) {
+  RawElement cues;
+  if (!readRawElement(data, size, 0, cues) || cues.id != kIdCues) {
+    return "{\"complete\":false,\"points\":[],\"error\":\"not a Cues element\"}";
+  }
+  const uint64_t end = std::min<uint64_t>(cues.dataEnd, size);
+  std::ostringstream out;
+  out << "{\"complete\":" << (cues.dataEnd <= size ? "true" : "false") << ",\"points\":[";
+  bool first = true;
+  RawElement point;
+  for (uint64_t pos = cues.dataStart; pos < end && readRawElement(data, size, pos, point) && !point.unknownSize &&
+       point.dataEnd <= end;
+       pos = point.dataEnd) {
+    if (point.id != kIdCuePoint) continue;
+    uint64_t time = 0;
+    std::vector<std::pair<uint64_t, uint64_t>> positions; // (track, cluster position)
+    RawElement f;
+    for (uint64_t q = point.dataStart; q < point.dataEnd && readRawElement(data, size, q, f) && !f.unknownSize &&
+         f.dataEnd <= point.dataEnd;
+         q = f.dataEnd) {
+      if (f.id == kIdCueTime) {
+        time = readRawUint(data, f.dataStart, f.dataEnd);
+      } else if (f.id == kIdCueTrackPositions) {
+        uint64_t track = 0;
+        uint64_t cluster = 0;
+        bool haveCluster = false;
+        RawElement g;
+        for (uint64_t r = f.dataStart; r < f.dataEnd && readRawElement(data, size, r, g) && !g.unknownSize &&
+             g.dataEnd <= f.dataEnd;
+             r = g.dataEnd) {
+          if (g.id == kIdCueTrack) track = readRawUint(data, g.dataStart, g.dataEnd);
+          else if (g.id == kIdCueClusterPosition) {
+            cluster = readRawUint(data, g.dataStart, g.dataEnd);
+            haveCluster = true;
+          }
+        }
+        if (haveCluster) positions.emplace_back(track, cluster);
+      }
+    }
+    for (const auto& tp : positions) {
+      if (!first) out << ",";
+      first = false;
+      out << "[" << time << "," << tp.first << "," << tp.second << "]";
+    }
+  }
+  out << "]}";
+  return out.str();
 }
 
 // Multi-track form: `trackMask` bit N set means "extract Matroska track N".

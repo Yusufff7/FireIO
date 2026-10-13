@@ -56,6 +56,13 @@ export interface MkvDemuxInitResult {
   // selection at all.
   audioTracks: MkvDemuxAudioTrack[];
   subtitleTracks: MkvDemuxSubtitleTrack[];
+
+  // Seek index location. Matroska positions in the SeekHead/Cues are
+  // relative to the Segment's payload, which starts at `segmentDataStart`
+  // (absolute). `cuesPosition` is the Cues element's position relative to
+  // that, or -1 when the file has no Cues (or its SeekHead doesn't say).
+  segmentDataStart: number;
+  cuesPosition: number;
 }
 
 export type MkvDemuxAudioTrack = {
@@ -175,6 +182,16 @@ export interface MkvDemuxModule extends KeplerTurboModule {
   // Ticks are raw Segment-timestampScale units, same convention as
   // findClusters' `timecode` field.
   extractTextCues: (chunk: ArrayBuffer, trackNumber: number, isAss: boolean) => string;
+
+  // ---- Seek index -----------------------------------------------------------
+  //
+  // Parses the Cues element (the file's time -> keyframe-Cluster index) from
+  // a buffer starting at it — fetch from segmentDataStart + cuesPosition.
+  // Returns JSON: {"complete": bool, "points": [[cueTimeTicks, trackNumber,
+  // clusterPosition], ...]} with clusterPosition relative to
+  // segmentDataStart. "complete" is false if the buffer cut the element
+  // short; the points before the cut are still returned.
+  parseCues: (chunk: ArrayBuffer) => string;
 }
 
 export default TurboModuleRegistry.getEnforcing<MkvDemuxModule>(
