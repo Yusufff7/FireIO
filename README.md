@@ -136,9 +136,9 @@ Video and audio are remuxed as **two independent fMP4 streams**, each fed to its
 
 ### Prerequisites
 
-- **Vega SDK** (provides the `vega` CLI, cross-compilers, and the device adaptor)
-- **Node.js 20+**
-- A Fire TV device in developer mode, or the Vega Virtual Device
+- **Docker** — the Vega SDK only runs on Linux, so everything builds inside a container ([`docker/`](docker/README.md) has the image and setup)
+- A **Fire TV Stick in developer mode**, reachable on your network
+- Optionally **Node.js 18+** on the host, for `scripts/check-addons.mjs`
 
 ### 1. Clone with submodules
 
@@ -178,15 +178,19 @@ Optionally, add a second set under `backupStreamAddonUrls`. When it's non-empty,
 
 Nothing in the app depends on *which* addons these are — only that they speak the Stremio stream protocol — so adding or removing one is a config change, not a code change.
 
-> `localDefaults.ts` is **gitignored**, because a configured addon URL usually embeds a personal API key, and anything in it gets compiled into the JS bundle. Leaving the list empty is valid; the app simply starts unconfigured.
+> `localDefaults.ts` is **gitignored**, because a configured addon URL usually embeds a personal API key, and anything in it gets compiled into the JS bundle. Leaving the list empty is valid; the app simply starts unconfigured. It's the one file of yours that isn't in the repository, so keep a copy somewhere private.
+
+To see how your addons are doing — whether they list streams, how fast the links answer, and whether those links are really video — run `node scripts/check-addons.mjs` (optionally with a title such as `tt0903747:1:1`). It prints release names only, never URLs.
 
 ### 3. Build and install
 
+Set up the build container once, as described in [docker/README.md](docker/README.md). After that, one command builds the native module and the app, packages them, and installs on the stick:
+
 ```bash
-npm install
-npm run build                      # builds the JS bundle + native module
-vega run-app <path-to-.vpkg> com.yusuf.stremiovega.main --deviceId <device>
+docker exec vega bash -lc 'cd /work/StremioVega && scripts/build.sh <build-number> <device-ip>:5555'
 ```
+
+The device only accepts a build number higher than the one it has, so increase it each time. Leave off the device address to just build; the package lands in `build/package/`.
 
 ---
 
@@ -195,13 +199,10 @@ vega run-app <path-to-.vpkg> com.yusuf.stremiovega.main --deviceId <device>
 The native parsing and remuxing logic has **no Kepler dependency**, which is deliberate: it can be compiled and run against real media files on a normal desktop, with no device deploy in the loop. This was the single biggest productivity win on the project — it turned a ~10-minute verify cycle into seconds.
 
 ```bash
-cd MkvDemuxModule
-# libmatroska looks for an *installed* libebml, which doesn't exist in an
-# in-tree build — this makes it use the one built alongside it instead.
-git apply patches/libmatroska-in-tree-ebml.patch
-
-cd test && cmake -B build && cmake --build build
+scripts/test-native.sh
 ```
+
+That applies a small CMake patch to libmatroska (it otherwise looks for an *installed* libebml rather than the one alongside it) and builds the tools into `MkvDemuxModule/test/build/`. Each prints its usage when run without arguments.
 
 | Tool | What it checks |
 |---|---|
@@ -226,10 +227,12 @@ FireIO/
 │   ├── player/mkvMse.ts      MSE session and seek logic
 │   ├── screens/              Home · Detail · Search · Player
 │   └── storage/              Settings, history, preferences
-└── MkvDemuxModule/           Native C++ turbo module
-    ├── kepler/turbo-modules/ MkvDemuxCore.cpp — parsing + remuxing
-    ├── test/                 Host-side test harness
-    └── third_party/          libebml · libmatroska (submodules) · minimp4
+├── MkvDemuxModule/           Native C++ turbo module
+│   ├── kepler/turbo-modules/ MkvDemuxCore.cpp — parsing + remuxing
+│   ├── test/                 Host-side test harness
+│   └── third_party/          libebml · libmatroska (submodules) · minimp4
+├── docker/                   Build container (Vega SDK runs on Linux)
+└── scripts/                  build.sh · test-native.sh · check-addons.mjs · make-icon.py
 ```
 
 ---
