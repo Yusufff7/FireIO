@@ -1,4 +1,5 @@
 import AsyncStorage from '@amazon-devices/react-native-async-storage__async-storage';
+import { canonicalLang, type TrackPreference } from '../addons/languages';
 
 // Two deliberately separate concerns, persisted under separate keys:
 //
@@ -37,28 +38,47 @@ export const DELAY_STEP = 0.25;
 const STYLE_KEY = 'stremiovega:subtitleStyle:v1';
 const DELAY_KEY = 'stremiovega:subtitleDelays:v1';
 const LANG_KEY = 'stremiovega:subtitleLangs:v1';
+const SUB_PREF_KEY = 'stremiovega:subtitlePrefs:v2';
+const AUDIO_PREF_KEY = 'stremiovega:audioPrefs:v1';
+
+// A remembered subtitle choice: which language and track, and whether it was
+// one of the file's own (embedded) tracks or an OpenSubtitles download — the
+// same kind is preferred when it's re-applied. `null` means "turned off".
+export type SubtitlePreference = TrackPreference & { source?: 'embedded' | 'external' };
 
 export const DEFAULT_SUBTITLE_STYLE: SubtitleStyle = { size: 26, background: 'outline' };
 
 let styleCache: SubtitleStyle | null = null;
 let delayCache: Record<string, number> | null = null;
-let langCache: Record<string, string | null> | null = null;
+let subPrefCache: Record<string, SubtitlePreference | null> | null = null;
+let audioPrefCache: Record<string, TrackPreference> | null = null;
 const styleListeners = new Set<(s: SubtitleStyle) => void>();
 
 export async function loadSubtitlePrefs(): Promise<void> {
   try {
-    const [rawStyle, rawDelays, rawLangs] = await Promise.all([
+    const [rawStyle, rawDelays, rawLangs, rawSubPrefs, rawAudioPrefs] = await Promise.all([
       AsyncStorage.getItem(STYLE_KEY),
       AsyncStorage.getItem(DELAY_KEY),
       AsyncStorage.getItem(LANG_KEY),
+      AsyncStorage.getItem(SUB_PREF_KEY),
+      AsyncStorage.getItem(AUDIO_PREF_KEY),
     ]);
     styleCache = rawStyle ? { ...DEFAULT_SUBTITLE_STYLE, ...JSON.parse(rawStyle) } : { ...DEFAULT_SUBTITLE_STYLE };
     delayCache = rawDelays ? JSON.parse(rawDelays) : {};
-    langCache = rawLangs ? JSON.parse(rawLangs) : {};
+    subPrefCache = rawSubPrefs ? JSON.parse(rawSubPrefs) : {};
+    audioPrefCache = rawAudioPrefs ? JSON.parse(rawAudioPrefs) : {};
+    // Carry over choices saved before track-level preferences existed (just
+    // a language code per show), for shows without a newer entry.
+    const legacy: Record<string, string | null> = rawLangs ? JSON.parse(rawLangs) : {};
+    for (const [show, lang] of Object.entries(legacy)) {
+      if (show in subPrefCache!) continue;
+      subPrefCache![show] = lang === null ? null : { lang: canonicalLang(lang) };
+    }
   } catch {
     styleCache = { ...DEFAULT_SUBTITLE_STYLE };
     delayCache = {};
-    langCache = {};
+    subPrefCache = {};
+    audioPrefCache = {};
   }
 }
 
@@ -89,22 +109,35 @@ export function getSubtitleDelaySync(id: string): number {
   return delayCache?.[showKey(id)] ?? 0;
 }
 
-// Which subtitle language was last chosen for this show, so resuming — or
-// starting the next episode — brings subtitles back automatically instead of
-// silently playing with none. Stored per show rather than per episode: it's
-// a preference about the show, and the episode ids change underneath it.
-// `null` is a real, remembered value meaning "I turned them off".
-export function getSubtitleLangSync(id: string): string | null | undefined {
-  const map = langCache ?? {};
+// The subtitle track last chosen for this show, so resuming — or starting
+// the next episode — brings the same subtitles back instead of playing with
+// none. Per show rather than per episode: it's a preference about the show,
+// and the episode ids change underneath it. `null` is a real, remembered
+// value meaning "I turned them off"; undefined means nothing's remembered.
+export function getSubtitlePrefSync(id: string): SubtitlePreference | null | undefined {
+  const map = subPrefCache ?? {};
   const key = showKey(id);
   return key in map ? map[key] : undefined;
 }
 
-export async function saveSubtitleLang(id: string, lang: string | null): Promise<void> {
-  const map = langCache ?? {};
-  map[showKey(id)] = lang;
-  langCache = map;
-  await AsyncStorage.setItem(LANG_KEY, JSON.stringify(map)).catch(() => {});
+export async function saveSubtitlePref(id: string, pref: SubtitlePreference | null): Promise<void> {
+  const map = subPrefCache ?? {};
+  map[showKey(id)] = pref;
+  subPrefCache = map;
+  await AsyncStorage.setItem(SUB_PREF_KEY, JSON.stringify(map)).catch(() => {});
+}
+
+// The audio track (language, plus name for same-language tracks such as a
+// commentary) last chosen for this show, applied when an episode loads.
+export function getAudioPrefSync(id: string): TrackPreference | undefined {
+  return (audioPrefCache ?? {})[showKey(id)];
+}
+
+export async function saveAudioPref(id: string, pref: TrackPreference): Promise<void> {
+  const map = audioPrefCache ?? {};
+  map[showKey(id)] = pref;
+  audioPrefCache = map;
+  await AsyncStorage.setItem(AUDIO_PREF_KEY, JSON.stringify(map)).catch(() => {});
 }
 
 export async function saveSubtitleDelay(id: string, seconds: number): Promise<void> {

@@ -65,7 +65,12 @@ function searchTitleFor(name: string, season: number): string {
 const ANILIST_QUERY =
   'query($s:String){Media(search:$s,type:ANIME,format_in:[TV,TV_SHORT,ONA]){idMal}}';
 
-async function fetchMalId(name: string, season: number): Promise<number | null> {
+// Lookups return `undefined` when the service couldn't be asked (timeout,
+// network error, rate limit, server error) and `null` only when it
+// answered "no such thing". Only the latter is cached — caching a transient
+// failure as "not anime" or "no data" (as an earlier version did) switched
+// Skip Intro off for that show for good after a single bad request.
+async function fetchMalId(name: string, season: number): Promise<number | null | undefined> {
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(), 10000);
   try {
@@ -75,11 +80,14 @@ async function fetchMalId(name: string, season: number): Promise<number | null> 
       body: JSON.stringify({ query: ANILIST_QUERY, variables: { s: searchTitleFor(name, season) } }),
       signal: ac.signal,
     });
-    if (!r.ok) return null;
+    // AniList answers a search with no match as 404; anything else that
+    // isn't 200 (429 rate limit, 5xx) says nothing about the title.
+    if (r.status === 404) return null;
+    if (!r.ok) return undefined;
     const j = (await r.json()) as { data?: { Media?: { idMal?: number | null } | null } };
     return j.data?.Media?.idMal ?? null;
   } catch {
-    return null;
+    return undefined;
   } finally {
     clearTimeout(t);
   }
@@ -88,13 +96,14 @@ async function fetchMalId(name: string, season: number): Promise<number | null> 
 // `episodeLength=0` opts out of AniSkip's duration matching. We often don't
 // know the real runtime at lookup time (the element may not have reported a
 // duration yet), and a mismatch there would drop otherwise-valid results.
-async function fetchSkipTimes(malId: number, episode: number): Promise<SkipTimes | null> {
+async function fetchSkipTimes(malId: number, episode: number): Promise<SkipTimes | null | undefined> {
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(), 10000);
   try {
     const url = `https://api.aniskip.com/v2/skip-times/${malId}/${episode}?types[]=op&types[]=ed&episodeLength=0`;
     const r = await fetch(url, { signal: ac.signal });
-    if (!r.ok) return null;
+    if (r.status === 404) return null; // AniSkip's "no skip times for this episode"
+    if (!r.ok) return undefined;
     const j = (await r.json()) as {
       found?: boolean;
       results?: Array<{ interval?: { startTime?: number; endTime?: number }; skipType?: string }>;
@@ -111,7 +120,7 @@ async function fetchSkipTimes(malId: number, episode: number): Promise<SkipTimes
     }
     return out.op || out.ed ? out : null;
   } catch {
-    return null;
+    return undefined;
   } finally {
     clearTimeout(t);
   }
@@ -134,7 +143,9 @@ export async function getSkipTimes(
   if (malKey in malCache) {
     malId = malCache[malKey];
   } else {
-    malId = await fetchMalId(seriesName, season);
+    const found = await fetchMalId(seriesName, season);
+    if (found === undefined) return null; // couldn't ask — try again next time
+    malId = found;
     malCache[malKey] = malId;
     persist(MAL_KEY, malCache);
   }
@@ -145,6 +156,7 @@ export async function getSkipTimes(
   if (skipKey in skipCache) return skipCache[skipKey];
 
   const times = await fetchSkipTimes(malId, episode);
+  if (times === undefined) return null; // couldn't ask — try again next time
   skipCache[skipKey] = times;
   persist(SKIP_KEY, skipCache);
   return times;

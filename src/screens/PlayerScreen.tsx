@@ -22,6 +22,7 @@ import {
 } from '../addons/streamSelection';
 import { getSkipTimes, type SkipTimes } from '../addons/skipTimes';
 import { MkvMseSession } from '../player/mkvMse';
+import { bestTrackMatch, canonicalLang } from '../addons/languages';
 import type { MkvDemuxAudioTrack, MkvDemuxSubtitleTrack } from '@amazon-devices/mkvdemuxmodule';
 import { getHistorySync, recordWatched, resumePositionFor, saveProgress } from '../storage/history';
 import {
@@ -29,10 +30,12 @@ import {
   SUBTITLE_BACKGROUNDS,
   SUBTITLE_SIZES,
   getSubtitleDelaySync,
-  getSubtitleLangSync,
+  getAudioPrefSync,
+  getSubtitlePrefSync,
   getSubtitleStyleSync,
   saveSubtitleDelay,
-  saveSubtitleLang,
+  saveAudioPref,
+  saveSubtitlePref,
   saveSubtitleStyle,
   type SubtitleStyle,
 } from '../storage/subtitlePrefs';
@@ -493,12 +496,16 @@ export function PlayerScreen({ route, navigation }: Props) {
   const selectAudioTrack = useCallback((trackNumber: number) => {
     const mse = mseSessionRef.current;
     if (!mse) return;
+    // Remembered for the show, so a resume or the next episode starts in
+    // this language (see MkvMseSession.prepare's preferredAudio).
+    const track = mse.getAudioTracks().find(t => t.trackNumber === trackNumber);
+    if (track) saveAudioPref(id, { lang: canonicalLang(track.language, track.name), name: track.name }).catch(() => {});
     mse.switchAudioTrack(trackNumber).then(ok => {
       if (ok) setActiveAudioTrackNumber(mse.getActiveAudioTrackNumber());
     });
     setPane('main');
     setShowTracks(false);
-  }, []);
+  }, [id]);
 
   // Subtitles come from OpenSubtitles and are keyed to the title, not to the
   // release being played — so they're fetched once here and survive every
@@ -595,10 +602,14 @@ export function PlayerScreen({ route, navigation }: Props) {
         if (isMkv) {
           const session = new MkvMseSession(resolvedUrl);
           try {
-            mseReady = await session.prepare(p as any, () => {
-              const el = playerRef.current as any;
-              return typeof el?.currentTime === 'number' ? el.currentTime : 0;
-            });
+            mseReady = await session.prepare(
+              p as any,
+              () => {
+                const el = playerRef.current as any;
+                return typeof el?.currentTime === 'number' ? el.currentTime : 0;
+              },
+              getAudioPrefSync(id),
+            );
           } catch (e) {
             console.warn('MkvMseSession: prepare threw, falling back to direct URL —', e);
             mseReady = false;
@@ -694,8 +705,15 @@ export function PlayerScreen({ route, navigation }: Props) {
               // Give up rather than seek into a pipeline that never got
               // healthy — starting from the beginning is a far better
               // outcome than poisoning the element with a doomed write.
-              if (attempts++ > 40) return;
-              if (rs < 4 || pos <= 0) {
+              if (attempts++ > 60) return;
+              // The remux (MSE) path seeks within its own buffered timeline,
+              // so it doesn't carry the direct-URL pipeline's risk described
+              // above and only needs playback actually running. Its
+              // readyState can also sit below 4 for a long time while the
+              // buffer fills, so gating on 4 there meant giving up and
+              // starting from the beginning.
+              const healthy = mseSessionRef.current ? pos > 0 || rs >= 2 : rs >= 4 && pos > 0;
+              if (!healthy) {
                 setTimeout(tryResume, 250);
                 return;
               }
@@ -1202,13 +1220,16 @@ export function PlayerScreen({ route, navigation }: Props) {
     );
   };
 
-  const selectSubtitle = (key: string | null) => {
+  // `remember` is false for the automatic re-apply below: a fallback it
+  // picks (say an OpenSubtitles track because this release has no matching
+  // embedded one) mustn't overwrite the choice that should apply next time.
+  const selectSubtitle = (key: string | null, remember = true) => {
     setCueSegments(null);
 
     if (key === null) {
       setActiveSubtitleKey(null);
       mseSessionRef.current?.selectEmbeddedSubtitleTrack(null, false);
-      saveSubtitleLang(id, null).catch(() => {});
+      if (remember) saveSubtitlePref(id, null).catch(() => {});
       return;
     }
 
@@ -1219,31 +1240,56 @@ export function PlayerScreen({ route, navigation }: Props) {
       const trackNumber = Number(key.slice('embedded:'.length));
       const track = mseSubtitleTracks.find(t => t.trackNumber === trackNumber);
       mseSessionRef.current?.selectEmbeddedSubtitleTrack(trackNumber, track?.codecId !== 'S_TEXT/UTF8');
+      if (remember && track) {
+        saveSubtitlePref(id, {
+          source: 'embedded',
+          lang: canonicalLang(track.language, track.name),
+          name: track.name,
+        }).catch(() => {});
+      }
     } else {
       mseSessionRef.current?.selectEmbeddedSubtitleTrack(null, false);
+      if (remember) {
+        saveSubtitlePref(id, { source: 'external', lang: canonicalLang(entry.lang), name: entry.variant }).catch(() => {});
+      }
     }
 
     setActiveSubtitleKey(key);
-    saveSubtitleLang(id, entry.lang || null).catch(() => {});
   };
 
-  // Re-apply the show's remembered subtitle language as soon as the tracks
-  // for this episode are available. Without this, resuming — or rolling into
-  // the next episode — started with subtitles off even though you'd had them
-  // on all series, because the selection lived only in this screen's state.
-  // Runs once per load; after that the user's in-session choice wins.
-  const autoSelectedRef = useRef(false);
+  // Re-applies the show's remembered subtitle choice for each new source —
+  // on resume, on the next episode, and when the app moves on to another
+  // release. The remembered kind (the file's own track vs OpenSubtitles) is
+  // preferred, matched by language ("eng", "en", "English" are one
+  // language) and then by track name, so "Full Subtitles" is picked over
+  // "Signs & Songs" when that's what was chosen. Embedded tracks are known
+  // as soon as the player is ready; OpenSubtitles arrives separately, so an
+  // OpenSubtitles choice (or a fallback to one) waits for it.
+  const autoSubtitleForRef = useRef<string | null>(null);
   useEffect(() => {
-    if (autoSelectedRef.current) return;
-    if (subtitlesLoading || allSubtitles.length === 0) return;
-    const remembered = getSubtitleLangSync(id);
-    if (remembered === undefined) return; // nothing stored for this show yet
-    autoSelectedRef.current = true;
-    if (remembered === null) return; // explicitly turned off — respect that
-    const match = allSubtitles.find(e => e.lang === remembered);
-    if (match) selectSubtitle(match.key);
+    if (!ready || !resolvedUrl || autoSubtitleForRef.current === resolvedUrl) return;
+    const pref = getSubtitlePrefSync(id);
+    if (pref === undefined || pref === null) {
+      autoSubtitleForRef.current = resolvedUrl;
+      // A previous source's embedded track doesn't exist in this one.
+      if (activeSubtitleKey?.startsWith('embedded:')) selectSubtitle(null, false);
+      return;
+    }
+    const embedded = bestTrackMatch(pref, mseSubtitleTracks, t => ({ code: t.language, name: t.name }));
+    if (embedded && pref.source !== 'external') {
+      autoSubtitleForRef.current = resolvedUrl;
+      selectSubtitle(`embedded:${embedded.trackNumber}`, false);
+      return;
+    }
+    if (subtitlesLoading) return;
+    autoSubtitleForRef.current = resolvedUrl;
+    const external = bestTrackMatch(pref, externalSubtitleEntries, e => ({ code: e.lang, name: e.variant }));
+    const fallbackEmbedded = embedded ? `embedded:${embedded.trackNumber}` : undefined;
+    const pick = pref.source === 'external' ? external?.key ?? fallbackEmbedded : external?.key;
+    if (pick) selectSubtitle(pick, false);
+    else if (activeSubtitleKey?.startsWith('embedded:')) selectSubtitle(null, false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [subtitlesLoading, allSubtitles.length, id]);
+  }, [ready, resolvedUrl, subtitlesLoading, mseSubtitleTracks, externalSubtitleEntries, id]);
 
   const applyDelay = (next: number) => {
     const rounded = Math.round(next * 100) / 100;

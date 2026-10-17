@@ -3,4 +3,7 @@
     "compilerOptions": {
         "types": ["jest", "@amazon-devices/react-native-kepler"], // Override "jest", "react-native" from @react-native/typescript-config
     },
+    // Build output, not sources: CMake writes dependency files named
+    // compiler_depend.ts into the native test build, which aren't TypeScript.
+    "exclude": ["node_modules", "build", "MkvDemuxModule/build", "MkvDemuxModule/test/build", "MkvDemuxModule/node_modules"],
 }

@@ -27,10 +27,21 @@ export function getHistorySync(): HistoryEntry[] {
 // Called when playback actually starts (not just when the Player screen
 // mounts) — moves the item to the front if it's already there, so
 // re-watching something bumps it rather than duplicating it.
+//
+// The saved position survives when it's the same episode starting again.
+// Writing the entry fresh (as an earlier version did) erased it at the very
+// moment playback started, so a resume only worked if nothing re-recorded
+// the entry before the first progress save — a source that failed and was
+// replaced, or backing out within a few seconds, lost the spot entirely.
 export async function recordWatched(item: Omit<HistoryEntry, 'watchedAt'>): Promise<HistoryEntry[]> {
   const current = cache ?? (await loadHistory());
+  const previous = current.find(h => h.id === item.id);
   const withoutItem = current.filter(h => h.id !== item.id);
-  const next = [{ ...item, watchedAt: Date.now() }, ...withoutItem].slice(0, MAX_ENTRIES);
+  const keptPosition =
+    previous && previous.episodeId === item.episodeId
+      ? { positionSec: previous.positionSec, durationSec: previous.durationSec }
+      : {};
+  const next = [{ ...keptPosition, ...item, watchedAt: Date.now() }, ...withoutItem].slice(0, MAX_ENTRIES);
   cache = next;
   await AsyncStorage.setItem(KEY, JSON.stringify(next));
   listeners.forEach(l => l(next));

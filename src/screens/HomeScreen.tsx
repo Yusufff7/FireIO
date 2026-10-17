@@ -26,6 +26,30 @@ import type { NativeStackScreenProps } from '@amazon-devices/react-navigation__n
 import type { RootStackParamList } from '../types';
 import { getSettingsSync, isConfigured } from '../storage/settings';
 
+// Whether each image URL actually loads, checked with a HEAD request and
+// remembered for the session. Continue Watching can't rely on the <Image>
+// error callback to walk its fallbacks: on this platform a 404 is reported
+// natively ("didReceiveFailure ... 404") without that callback reliably
+// firing, so a missing episode still left the card blank. A URL that can't
+// be checked at all (network hiccup) counts as usable — the image itself
+// gets the last word.
+const imageChecks = new Map<string, Promise<boolean>>();
+function imageLoads(url: string): Promise<boolean> {
+  let check = imageChecks.get(url);
+  if (!check) {
+    check = fetch(url, { method: 'HEAD' })
+      .then(r => r.ok || r.status === 405) // 405: HEAD not allowed — let the image try
+      .catch(() => true);
+    imageChecks.set(url, check);
+  }
+  return check;
+}
+
+async function firstLoadingImage(candidates: string[]): Promise<string | null> {
+  for (const url of candidates) if (await imageLoads(url)) return url;
+  return null;
+}
+
 type Props = NativeStackScreenProps<RootStackParamList, 'Home'>;
 
 const FOCUS_DEBOUNCE_MS = 150;
@@ -71,9 +95,22 @@ const ContinueWatchingCard = React.memo(React.forwardRef<
   // one 404s rather than being absent from the metadata — so the <Image>
   // rendered as an empty box. Walk a real fallback chain on load failure:
   // episode still -> series backdrop (also 16:9) -> poster -> placeholder.
+  //
+  // Each candidate is checked before it's shown (see imageLoads), and the
+  // image's own error callback still advances the chain if it does fire.
   const [failedCount, setFailedCount] = useState(0);
-  const candidates = [item.episodeThumbnail, item.background, item.poster].filter(Boolean) as string[];
-  const image = candidates[failedCount];
+  const candidates = ([item.episodeThumbnail, item.background, item.poster].filter(Boolean) as string[]).slice(failedCount);
+  const candidatesKey = candidates.join('|');
+  // undefined while checking, null when none of them load.
+  const [image, setImage] = useState<string | null | undefined>(undefined);
+  useEffect(() => {
+    let alive = true;
+    setImage(undefined);
+    firstLoadingImage(candidatesKey ? candidatesKey.split('|') : []).then(url => alive && setImage(url));
+    return () => {
+      alive = false;
+    };
+  }, [candidatesKey]);
   // Entries written before the series name and episode label were stored
   // separately have the label baked into the name too. Strip it on read so
   // those don't show "S1E1" twice without needing to be re-watched first.
@@ -99,7 +136,10 @@ const ContinueWatchingCard = React.memo(React.forwardRef<
         <Image
           key={image}
           source={{ uri: image }}
-          onError={() => setFailedCount(n => n + 1)}
+          onError={() => {
+            imageChecks.set(image, Promise.resolve(false));
+            setFailedCount(n => n + 1);
+          }}
           style={[styles.cwImage, focused && styles.cwImageFocused]}
           resizeMode="cover"
         />

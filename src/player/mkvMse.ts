@@ -7,6 +7,7 @@ import MkvDemuxModule, {
   type MkvDemuxSubtitleTrack,
 } from '@amazon-devices/mkvdemuxmodule';
 import { parseCueSegments, type SrtCue } from '../addons/subtitles';
+import { bestTrackMatch, type TrackPreference } from '../addons/languages';
 
 // Plays an MKV through MediaSource Extensions by remuxing it to fragmented
 // MP4 on the fly, because this platform's native player cannot seek
@@ -351,7 +352,10 @@ export class MkvMseSession {
   // the first window. Returns false (after cleaning up) when MSE playback
   // isn't viable for this file; the caller then falls back to direct-URL
   // playback.
-  async prepare(player: PlayerLike, getCurrentTime: () => number): Promise<boolean> {
+  //
+  // `preferredAudio` is the show's remembered audio choice (language and
+  // track name); it wins over the file's default track when it's playable.
+  async prepare(player: PlayerLike, getCurrentTime: () => number, preferredAudio?: TrackPreference): Promise<boolean> {
     try {
       const result = await this.fetchInitSegment();
       if (!result) return false;
@@ -367,7 +371,7 @@ export class MkvMseSession {
       // platform's own Matroska pipeline plays those codecs with sound, it
       // just can't seek — and silent-but-seekable proved the worse trade on
       // device. A file with no audio tracks at all still plays here.
-      const audioPick = this.pickAudioTrack(result);
+      const audioPick = this.pickAudioTrack(result, preferredAudio);
       if (!audioPick && (result.audioTracks?.length || result.audioCodecId)) {
         console.warn('MkvMseSession: no playable audio track, falling back to direct URL for sound');
         return false;
@@ -539,7 +543,10 @@ export class MkvMseSession {
   // track is in an unsupported codec still plays with sound, in its other
   // language. Falls back to the init result's primary fields for a file
   // whose audioTracks list is somehow empty.
-  private pickAudioTrack(result: MkvDemuxInitResult): { track: MkvDemuxAudioTrack; mime: string } | undefined {
+  private pickAudioTrack(
+    result: MkvDemuxInitResult,
+    preferred?: TrackPreference,
+  ): { track: MkvDemuxAudioTrack; mime: string } | undefined {
     const tracks: MkvDemuxAudioTrack[] = result.audioTracks?.length
       ? result.audioTracks
       : result.audioCodecId
@@ -557,7 +564,9 @@ export class MkvMseSession {
           },
         ]
       : [];
-    const primary = tracks.find(t => t.trackNumber === result.audioTrackNumber);
+    const playable = tracks.filter(t => supportedAudioMime(t.codecId) !== null);
+    const remembered = preferred ? bestTrackMatch(preferred, playable, t => ({ code: t.language, name: t.name })) : undefined;
+    const primary = remembered ?? tracks.find(t => t.trackNumber === result.audioTrackNumber);
     const ordered = primary ? [primary, ...tracks.filter(t => t !== primary)] : tracks;
     for (const track of ordered) {
       const mime = supportedAudioMime(track.codecId);
