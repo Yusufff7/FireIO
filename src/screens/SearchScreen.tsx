@@ -50,7 +50,7 @@ export function SearchScreen({ navigation }: Props) {
   }, [query]);
 
   const openDetail = useCallback(
-    (item: Meta) => navigation.navigate('Detail', { id: item.id, type: item.type }),
+    (item: Meta) => navigation.navigate('Detail', { id: item.id, type: item.type, initial: item }),
     [navigation],
   );
 

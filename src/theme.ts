@@ -55,10 +55,20 @@ export const radius = {
 };
 
 // The design's focus/selection signature: an ice-blue glow lift.
-export const glow = (color: string = colors.focusGlow, opacity = 0.55, blur = 22) => ({
+//
+// Kept tight on purpose. The blur is redrawn every frame the focused tile
+// moves (row scroll, focus scale), and at the old 22px radius / elevation 12
+// that was a visible share of the frame budget on the stick's GPU. A 14px
+// halo reads the same at TV distance.
+export const glow = (color: string = colors.focusGlow, opacity = 0.5, blur = 14) => ({
   shadowColor: color,
   shadowOpacity: opacity,
   shadowRadius: blur,
   shadowOffset: { width: 0, height: 0 },
-  elevation: 12,
+  elevation: 6,
 });
+
+// Focus "lift" timing shared by every focusable tile. Scale runs on the
+// native driver, so it stays smooth even while JS is busy re-rendering the
+// hero for the newly focused title.
+export const FOCUS_SCALE_MS = 150;

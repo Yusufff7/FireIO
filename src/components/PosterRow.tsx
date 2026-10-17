@@ -1,9 +1,21 @@
-import React, { useCallback, useRef, useState } from 'react';
-import { FlatList, Pressable, StyleSheet, Text, View } from 'react-native';
+import React, { useCallback, useMemo } from 'react';
+import { StyleSheet, Text, View } from 'react-native';
 import { TVFocusGuideView } from '@amazon-devices/react-native-kepler';
+import { Carousel, type CarouselRenderInfo } from '@amazon-devices/vega-carousel';
 import { PosterCard } from './PosterCard';
 import { colors, spacing } from '../theme';
 import type { Meta } from '../types';
+
+// One Home row, on Amazon's native Vega Carousel rather than a FlatList.
+//
+// The FlatList kept every card it had ever realised inside its window —
+// with nine rows that was hundreds of decoded posters on a 1 GB stick — and
+// scrolled through JS-driven virtualisation that dropped frames whenever the
+// JS thread was busy (which, on Home, is every focus change). The Carousel
+// recycles a fixed set of item views (renderedItemsCount) and runs the
+// scroll animation natively, the way TV-first apps do it. Its "anchored"
+// strategy is the Netflix motion: the selected card stays put at the start
+// of the row and the row slides under it.
 
 function PosterRowBase({
   title,
@@ -12,92 +24,62 @@ function PosterRowBase({
   onItemFocus,
   autoFocusFirst,
   guideRef,
-  restoreLastFocused,
 }: {
   title: string;
   data: Meta[];
   onSelect: (item: Meta) => void;
-  onItemFocus?: (item: Meta) => void;
+  onItemFocus?: (item: Meta, index: number) => void;
   autoFocusFirst?: boolean;
   // Lets a parent grab this row's focus guide and call requestTVFocus() on
   // it — the only reliable way to hand focus back after returning to a
   // screen that never unmounted. See HomeScreen.
   guideRef?: React.Ref<React.ComponentRef<typeof TVFocusGuideView>>;
-  // Set on the one row that held focus when the screen was left. Suppresses
-  // the first-card destination so the guide's own autoFocus can restore
-  // whichever card was actually focused — which is what you want coming back
-  // from a title, as opposed to arriving at a row from above.
-  restoreLastFocused?: boolean;
 }) {
-  // `autoFocus` alone restores whichever card in this row had focus last, so
-  // dropping into a row you'd already scrolled sideways landed you mid-row
-  // rather than at the start. Naming the first card as an explicit
-  // destination makes entering the row always mean entering it at item one.
-  // Held in state, not just a ref, because the guide needs to re-render once
-  // the node actually exists.
-  const [firstCard, setFirstCard] = useState<React.ComponentRef<typeof Pressable> | null>(null);
-  const listRef = useRef<FlatList<Meta>>(null);
-
-  // Stable identities so FlatList doesn't treat every parent render as a
-  // reason to re-render every visible cell.
-  const keyExtractor = useCallback((item: Meta) => item.id, []);
-  const getItemLayout = useCallback(
-    (_: ArrayLike<Meta> | null | undefined, index: number) => ({
-      length: CARD_STRIDE,
-      offset: CARD_STRIDE * index,
-      index,
-    }),
-    [],
+  const getItem = useCallback((index: number) => data[index], [data]);
+  const getItemCount = useCallback(() => data.length, [data]);
+  const getItemKey = useCallback((info: CarouselRenderInfo<Meta>) => info.item?.id ?? String(info.index), []);
+  const notifyDataError = useCallback(() => false, []);
+  const dataAdapter = useMemo(
+    () => ({ getItem, getItemCount, getItemKey, notifyDataError }),
+    [getItem, getItemCount, getItemKey, notifyDataError],
   );
+
   const renderItem = useCallback(
-    ({ item, index }: { item: Meta; index: number }) => (
-      <PosterCard
-        ref={index === 0 ? setFirstCard : undefined}
-        item={item}
-        onPress={() => onSelect(item)}
-        onFocus={() => {
-          // Entering at item one should also mean *seeing* item one — the
-          // list keeps its horizontal offset otherwise. Skipped while
-          // restoring, where the remembered card may legitimately be
-          // further along the row.
-          if (index === 0 && !restoreLastFocused) listRef.current?.scrollToOffset({ offset: 0, animated: false });
-          onItemFocus?.(item);
-        }}
-        hasTVPreferredFocus={autoFocusFirst && index === 0}
-      />
+    ({ item, index }: CarouselRenderInfo<Meta>) => (
+      // The slot is the row's full height; the top padding is the room the
+      // focus ring, glow and lift draw into above the poster.
+      <View style={styles.slot}>
+        <PosterCard
+          flush
+          item={item}
+          onPress={() => onSelect(item)}
+          onFocus={() => onItemFocus?.(item, index)}
+          hasTVPreferredFocus={autoFocusFirst && index === 0}
+        />
+      </View>
     ),
-    [onSelect, onItemFocus, autoFocusFirst, restoreLastFocused],
+    [onSelect, onItemFocus, autoFocusFirst],
   );
 
   if (data.length === 0) return null;
   return (
     <View style={styles.row}>
       <Text style={styles.title}>{title}</Text>
-      <TVFocusGuideView
-        ref={guideRef}
-        style={styles.listWrap}
-        autoFocus
-        destinations={!restoreLastFocused && firstCard ? [firstCard] : undefined}>
-        <FlatList
-          ref={listRef}
-          horizontal
-          data={data}
-          keyExtractor={keyExtractor}
-          showsHorizontalScrollIndicator={false}
-          // Windowing config per Vega's FlatList guidance. A row is ~7 cards
-          // wide on screen; rendering 8 up front covers the visible set plus
-          // one, and a window of 3 screens' worth keeps a small buffer either
-          // side rather than realising every poster in a 100-item catalog.
-          initialNumToRender={8}
-          maxToRenderPerBatch={6}
-          updateCellsBatchingPeriod={60}
-          windowSize={3}
-          removeClippedSubviews
-          // Every card is a fixed width, so offsets can be computed instead
-          // of measured — this skips layout passes entirely while scrolling.
-          getItemLayout={getItemLayout}
-          contentContainerStyle={styles.listContent}
+      <TVFocusGuideView ref={guideRef} style={styles.listWrap} autoFocus={autoFocusFirst}>
+        <Carousel
+          uniqueId={title}
+          orientation="horizontal"
+          dataAdapter={dataAdapter}
           renderItem={renderItem}
+          // ~11 cards fit across the screen; a few extra either side are
+          // what the next presses reveal.
+          renderedItemsCount={15}
+          numOffsetItems={3}
+          selectionStrategy="anchored"
+          navigableScrollAreaMargin={spacing.md}
+          containerStyle={styles.carousel}
+          itemStyle={ITEM_STYLE}
+          animationDuration={ANIMATION}
         />
       </TVFocusGuideView>
     </View>
@@ -105,13 +87,16 @@ function PosterRowBase({
 }
 
 // Whole rows are memo'd too — HomeScreen re-renders on every hero change, and
-// without this each of those walked all ~9 rows and their visible cards.
+// without this each of those walked all ~9 rows.
 export const PosterRow = React.memo(PosterRowBase);
 
-// Must match PosterCard's own width + marginRight — getItemLayout computes
-// offsets from this instead of measuring, so a mismatch shows up as cards
-// landing slightly off when scrolled programmatically.
-const CARD_STRIDE = 106 + 14;
+// Module-level so their identity never changes: a new object each render
+// would read to the carousel as a style change.
+const ITEM_STYLE = { itemPadding: 14, pressedItemScaleFactor: 0.95, selectedItemScaleFactor: 1 };
+const ANIMATION = { itemPressedDuration: 0.12, itemScrollDuration: 0.18 };
+
+// The list band under the row title.
+export const ROW_LIST_HEIGHT = 196;
 
 const styles = StyleSheet.create({
   row: {
@@ -128,18 +113,9 @@ const styles = StyleSheet.create({
     marginBottom: spacing.xs,
     paddingHorizontal: spacing.lg,
   },
-  // Sized to exactly what's inside it — listContent's own vertical padding
-  // (12 + 6) + the poster (142) + the title's gap and two lines (6 + 30).
-  // Any slack beyond that reads as dead black space between the rows.
-  listWrap: { height: 196 },
-  // Padding on every side the focus ring can extend into: the ring is drawn
-  // outside the poster's own box (outlineOffset) plus a soft glow, so with
-  // the cards flush against the list's edges the top of the ring was being
-  // clipped off by the list's own bounds.
-  listContent: {
-    paddingLeft: spacing.md,
-    paddingRight: spacing.md,
-    paddingTop: spacing.sm,
-    paddingBottom: spacing.xs,
-  },
+  // Sized to exactly what's inside it: the slot's top padding (12) + the
+  // card (178) + a little room under it (6).
+  listWrap: { height: ROW_LIST_HEIGHT },
+  carousel: { width: '100%', height: ROW_LIST_HEIGHT },
+  slot: { height: ROW_LIST_HEIGHT, paddingTop: spacing.sm },
 });

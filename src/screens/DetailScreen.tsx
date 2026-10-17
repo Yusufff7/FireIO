@@ -1,8 +1,12 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, FlatList, Image, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, Animated, FlatList, Image, StyleSheet, Text, View } from 'react-native';
 import { useTVEventHandler } from '@amazon-devices/react-native-kepler';
 import { Focusable } from '../components/Focusable';
 import { meta } from '../addons/client';
+import { backdropThumb, stillThumb } from '../addons/images';
+import { trailerIdFor } from '../addons/trailers';
+import { TrailerSurface } from '../components/TrailerSurface';
+import { getTrailer, startTrailer, stopTrailer } from '../player/trailerController';
 import { colors, radius, spacing } from '../theme';
 import type { Episode, Meta } from '../types';
 import type { NativeStackScreenProps } from '@amazon-devices/react-navigation__native-stack';
@@ -20,6 +24,20 @@ const BACKDROP_SCRIM =
   'linear-gradient(90deg, rgba(10,10,11,0.97) 0%, rgba(10,10,11,0.88) 35%, rgba(10,10,11,0.55) 70%, rgba(10,10,11,0.35) 100%)';
 const BACKDROP_SCRIM_VERTICAL =
   'linear-gradient(0deg, rgba(10,10,11,0.98) 0%, rgba(10,10,11,0.6) 40%, rgba(10,10,11,0.25) 75%, rgba(10,10,11,0.35) 100%)';
+// While the trailer plays, the heavy scrims above fade out and only these
+// stay: dark behind the text column on the left and along the bottom
+// (episodes), clear over the rest, so the video reads as the page's
+// background rather than something behind smoked glass.
+const TRAILER_SCRIM =
+  'linear-gradient(90deg, rgba(10,10,11,0.88) 0%, rgba(10,10,11,0.62) 30%, rgba(10,10,11,0.12) 58%, transparent 75%)';
+const TRAILER_SCRIM_VERTICAL =
+  'linear-gradient(0deg, rgba(10,10,11,0.85) 0%, rgba(10,10,11,0.35) 30%, transparent 55%)';
+
+// Detail's own trailer, when the title wasn't opened with one already
+// playing: loads shortly after the page appears and plays at
+// DETAIL_TRAILER_PLAY_MS.
+const DETAIL_TRAILER_LOAD_MS = 500;
+const DETAIL_TRAILER_PLAY_MS = 1500;
 
 // Cinemeta files anything that isn't part of the numbered run — OVAs,
 // recaps, specials — under season 0. "Season 0" is meaningless to a viewer,
@@ -58,7 +76,8 @@ function EpisodeCard({
 }) {
   const [focused, setFocused] = useState(false);
   const [thumbFailed, setThumbFailed] = useState(false);
-  const thumb = !thumbFailed && video.thumbnail ? video.thumbnail : fallbackImage;
+  // Sized for the 124-wide tile (see addons/images) — a season is 20+ of these.
+  const thumb = !thumbFailed && video.thumbnail ? stillThumb(video.thumbnail) : backdropThumb(fallbackImage);
   const summary = episodeSummary(video);
   const aired = airedYear(video);
   return (
@@ -108,9 +127,14 @@ function EpisodeCard({
 }
 
 export function DetailScreen({ route, navigation }: Props) {
-  const { id, type } = route.params;
-  const [info, setInfo] = useState<Meta | null>(null);
+  const { id, type, initial } = route.params;
+  // Drawn straight away from what Home already had (title, art, description,
+  // genres), so opening a title is instant instead of a full-screen spinner
+  // over a network round trip. The full record — episodes, cast — replaces
+  // it when it lands, usually already cached by Home's prefetch.
+  const [info, setInfo] = useState<Meta | null>(initial ?? null);
   const [loading, setLoading] = useState(true);
+  const hadInitial = useRef(Boolean(initial)).current;
   const [activeSeason, setActiveSeason] = useState<number | null>(null);
 
   // Season switching is a left/right gesture on the episode list, not a
@@ -131,15 +155,61 @@ export function DetailScreen({ route, navigation }: Props) {
     if (next !== undefined) setActiveSeason(next);
   });
 
+  // Trailer: a title opened from Home while its trailer was playing keeps
+  // that same playback (the controller just gains this screen's full-size
+  // surface); otherwise this page starts its own. Leaving the page — back,
+  // or on into the player — stops it.
+  const infoRef = useRef(info);
+  infoRef.current = info;
+  useEffect(() => {
+    const openedAt = Date.now();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let active = true;
+    if (getTrailer()?.itemId !== id) {
+      stopTrailer();
+      timer = setTimeout(async () => {
+        let ytId = infoRef.current ? trailerIdFor(infoRef.current) : undefined;
+        if (!ytId) {
+          const full = await meta(type, id);
+          ytId = full ? trailerIdFor(full) : undefined;
+        }
+        if (ytId && active) startTrailer(id, ytId, openedAt + DETAIL_TRAILER_PLAY_MS);
+      }, DETAIL_TRAILER_LOAD_MS);
+    }
+    const stop = () => {
+      active = false;
+      if (timer) clearTimeout(timer);
+      if (getTrailer()?.itemId === id) stopTrailer();
+    };
+    const unsubBlur = navigation.addListener('blur', stop);
+    return () => {
+      unsubBlur();
+      stop();
+    };
+  }, [id, type, navigation]);
+
+  const heavyScrim = useRef(new Animated.Value(1)).current;
+  const onTrailerPlaying = (playing: boolean) => {
+    Animated.timing(heavyScrim, { toValue: playing ? 0 : 1, duration: 600, useNativeDriver: true }).start();
+  };
+
   useEffect(() => {
     let cancelled = false;
-    meta(type, id).then(m => !cancelled && setInfo(m)).finally(() => !cancelled && setLoading(false));
+    meta(type, id)
+      .then(m => {
+        if (cancelled) return;
+        // A failed lookup keeps the catalog entry for a movie (it has
+        // everything Play needs); a series without its episode list has
+        // nothing to show, which is the "unavailable" page below.
+        if (m || type === 'series' || !hadInitial) setInfo(m);
+      })
+      .finally(() => !cancelled && setLoading(false));
     return () => {
       cancelled = true;
     };
-  }, [id, type]);
+  }, [id, type, hadInitial]);
 
-  if (loading) {
+  if (loading && !info) {
     return (
       <View style={styles.center}>
         <ActivityIndicator color={colors.text} size="large" />
@@ -175,6 +245,8 @@ export function DetailScreen({ route, navigation }: Props) {
   const seasons = [...new Set(episodes.map(v => v.season))].sort(bySeasonOrder);
   const season = activeSeason ?? seasons[0] ?? null;
   const isSeries = type === 'series' && seasons.length > 0;
+  // A series opened from its catalog entry, before the episode list is in.
+  const episodesPending = type === 'series' && loading && episodes.length === 0;
   seasonNavRef.current = { seasons, season };
 
   // Cinemeta's own genre list is the only signal available here — no
@@ -242,8 +314,13 @@ export function DetailScreen({ route, navigation }: Props) {
       {info.background && (
         <Image source={{ uri: info.background }} style={styles.backdrop} resizeMode="cover" />
       )}
-      <View style={[StyleSheet.absoluteFill, { experimental_backgroundImage: BACKDROP_SCRIM_VERTICAL }]} pointerEvents="none" />
-      <View style={[StyleSheet.absoluteFill, { experimental_backgroundImage: BACKDROP_SCRIM }]} pointerEvents="none" />
+      <TrailerSurface itemId={id} style={StyleSheet.absoluteFill} onPlayingChange={onTrailerPlaying} />
+      <View style={[StyleSheet.absoluteFill, { experimental_backgroundImage: TRAILER_SCRIM_VERTICAL }]} pointerEvents="none" />
+      <View style={[StyleSheet.absoluteFill, { experimental_backgroundImage: TRAILER_SCRIM }]} pointerEvents="none" />
+      <Animated.View style={[StyleSheet.absoluteFill, { opacity: heavyScrim }]} pointerEvents="none">
+        <View style={[StyleSheet.absoluteFill, { experimental_backgroundImage: BACKDROP_SCRIM_VERTICAL }]} />
+        <View style={[StyleSheet.absoluteFill, { experimental_backgroundImage: BACKDROP_SCRIM }]} />
+      </Animated.View>
 
       <View style={styles.content}>
         <View style={styles.headerRow}>
@@ -282,6 +359,8 @@ export function DetailScreen({ route, navigation }: Props) {
             )}
           </View>
         </View>
+
+        {episodesPending && <ActivityIndicator color={colors.text} style={styles.episodesSpinner} />}
 
         {isSeries && (
           <>
@@ -411,6 +490,7 @@ const styles = StyleSheet.create({
   // No glow(): same reasoning as the player's menu rows — on a box this wide
   // the shadow floods the whole card instead of tracing its edge.
   episodeCardFocused: { borderColor: colors.accent, backgroundColor: colors.glassFocused },
+  episodesSpinner: { marginTop: spacing.xl },
   episodeThumbWrap: { flexShrink: 0 },
   episodeThumb: { width: 124, height: 70, borderRadius: radius.sm, backgroundColor: colors.glass },
   episodeThumbEmpty: { alignItems: 'center', justifyContent: 'center' },

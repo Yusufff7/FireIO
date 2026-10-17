@@ -24,11 +24,25 @@ export const search = (type: MediaType, q: string): Promise<Meta[]> => {
     .then(r => r.metas ?? []);
 };
 
+// Shared by Home (hero details, trailer ids, and a prefetch once focus rests
+// on a title) and Detail, so opening a title Home has already looked up
+// draws immediately instead of waiting on a second identical request. A
+// failure isn't kept, so the next caller retries.
+const metaCache = new Map<string, Promise<Meta | null>>();
+
 export const meta = (type: MediaType, id: string): Promise<Meta | null> => {
+  const key = `${type}:${id}`;
+  const hit = metaCache.get(key);
+  if (hit) return hit;
   const { cinemetaBase } = getSettingsSync();
-  return json<{ meta: Meta }>(`${cinemetaBase}/meta/${type}/${id}.json`)
+  const value = json<{ meta: Meta }>(`${cinemetaBase}/meta/${type}/${id}.json`)
     .then(r => r.meta ?? null)
     .catch(() => null);
+  metaCache.set(key, value);
+  value.then(m => {
+    if (!m) metaCache.delete(key);
+  });
+  return value;
 };
 
 // Some addons inject non-playable "control" rows (account rescan triggers and

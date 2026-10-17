@@ -31,6 +31,7 @@
     "@amazon-devices/react-navigation__native": "^8.0.9000000001",
     "@amazon-devices/react-navigation__native-stack": "^8.0.9000000001",
     "@amazon-devices/shopify__flash-list": "^2.0.9000000001",
+    "@amazon-devices/vega-carousel": "~1.0.1",
     "react": "19.2.0",
     "react-native": "0.83.0"
   },

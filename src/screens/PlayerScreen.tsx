@@ -22,6 +22,7 @@ import {
 } from '../addons/streamSelection';
 import { getSkipTimes, type SkipTimes } from '../addons/skipTimes';
 import { MkvMseSession } from '../player/mkvMse';
+import { pendingTeardown, trackTeardown } from '../player/sharedDecoder';
 import { bestTrackMatch, canonicalLang } from '../addons/languages';
 import type { MkvDemuxAudioTrack, MkvDemuxSubtitleTrack } from '@amazon-devices/mkvdemuxmodule';
 import { getHistorySync, recordWatched, resumePositionFor, saveProgress } from '../storage/history';
@@ -550,7 +551,9 @@ export function PlayerScreen({ route, navigation }: Props) {
     // resource whose discontinuity-tracking state hadn't been reset yet
     // because the old teardown was still in flight — which then stalled
     // the new source exactly like the seek-path discontinuity bug did.
-    const previousTeardown = teardownRef.current;
+    // Home's hero trailer owns a VideoPlayer too, and may still be tearing
+    // down when this screen opens — wait for that as well.
+    const previousTeardown = Promise.all([teardownRef.current, pendingTeardown()]);
 
     const p = new VideoPlayer();
     playerRef.current = p;
@@ -765,6 +768,7 @@ export function PlayerScreen({ route, navigation }: Props) {
       // awaits this before touching the pipeline again. See this effect's
       // own top-of-body comment for why that's required, not optional.
       teardownRef.current = (playerRef.current?.deinitialize?.() ?? Promise.resolve()).catch(() => {});
+      trackTeardown(teardownRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [resolvedUrl]);

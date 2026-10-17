@@ -7,8 +7,15 @@ import type { Meta } from '../types';
 // Real CSS gradient (RN 0.83's `experimental_backgroundImage`) — replaces
 // the old 7-layer stacked-View scrim, which rendered as visible opacity
 // bands rather than a smooth fade. One View, one gradient, no banding.
+//
+// Kept light so a playing trailer isn't buried: the bottom only needs to
+// reach solid right at the edge (where rows slide in underneath), and the
+// text gets a soft side fade plus its own shadow instead of a dark band
+// across the whole hero.
 export const SCRIM_GRADIENT =
-  'linear-gradient(0deg, rgba(10,10,11,1) 0%, rgba(10,10,11,0.88) 28%, rgba(10,10,11,0.4) 58%, rgba(10,10,11,0.06) 82%, transparent 100%)';
+  'linear-gradient(0deg, rgba(10,10,11,1) 0%, rgba(10,10,11,0.72) 14%, rgba(10,10,11,0.28) 36%, transparent 62%)';
+export const SCRIM_SIDE_GRADIENT =
+  'linear-gradient(90deg, rgba(10,10,11,0.62) 0%, rgba(10,10,11,0.3) 32%, transparent 58%)';
 
 // Backdrop and content are separate components so the caller can slot a
 // SINGLE, never-animated scrim between them (see HomeScreen). With the scrim
@@ -82,6 +89,7 @@ export function Hero({
         <>
           <HeroBackdrop item={item} />
           <View style={[StyleSheet.absoluteFill, { experimental_backgroundImage: SCRIM_GRADIENT }]} pointerEvents="none" />
+          <View style={[StyleSheet.absoluteFill, { experimental_backgroundImage: SCRIM_SIDE_GRADIENT }]} pointerEvents="none" />
         </>
       )}
       <View style={[styles.content, compact && styles.contentCompact]}>
@@ -122,6 +130,14 @@ export function Hero({
     </View>
   );
 }
+
+// What keeps the hero text readable over bright video now that the scrim
+// is light.
+const TEXT_SHADOW = {
+  textShadowColor: 'rgba(0,0,0,0.85)',
+  textShadowOffset: { width: 0, height: 1 },
+  textShadowRadius: 6,
+};
 
 const styles = StyleSheet.create({
   // Fills whatever height the caller's container gives it (see HomeScreen's
@@ -171,15 +187,17 @@ const styles = StyleSheet.create({
     fontSize: 40,
     fontWeight: '800',
     letterSpacing: -0.3,
+    ...TEXT_SHADOW,
   },
   titleCompact: { fontSize: 26 },
-  meta: { color: colors.textDim, fontSize: 15, fontWeight: '600', marginTop: spacing.sm },
+  meta: { color: colors.textDim, fontSize: 15, fontWeight: '600', marginTop: spacing.sm, ...TEXT_SHADOW },
   description: {
     color: colors.textDim,
     fontSize: 15,
     lineHeight: 21,
+    ...TEXT_SHADOW,
   },
-  castLine: { color: colors.textFaint, fontSize: 13, fontWeight: '600', marginTop: spacing.xs },
+  castLine: { color: colors.textFaint, fontSize: 13, fontWeight: '600', marginTop: spacing.xs, ...TEXT_SHADOW },
   bodyRow: {
     flexDirection: 'row',
     alignItems: 'center',

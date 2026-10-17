@@ -19,6 +19,11 @@ export type Meta = {
   // the fields it sends (the episode name is under `name`); it's kept as an
   // optional alias so older stored entries don't break.
   videos?: Episode[];
+  // Trailers, as Cinemeta sends them on both catalog entries and meta():
+  // `trailerStreams` carries the YouTube id directly; `trailers` is the
+  // older shape, where `source` is the YouTube id.
+  trailerStreams?: { title?: string; ytId?: string }[];
+  trailers?: { source?: string; type?: string }[];
 };
 
 export type Episode = {
@@ -66,7 +71,9 @@ export type Subtitle = {
 export type RootStackParamList = {
   Home: undefined;
   Search: undefined;
-  Detail: { id: string; type: MediaType };
+  // `initial`: the catalog entry the title was opened from, drawn while the
+  // full record loads.
+  Detail: { id: string; type: MediaType; initial?: Meta };
   // PlayerScreen always resolves its own stream: it fetches every source
   // for `id`/`type`, buckets by language/resolution, and walks candidates in
   // priority order (or `preferredLanguage`/`preferredResolution`, with

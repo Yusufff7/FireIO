@@ -4,20 +4,24 @@ import {
   Animated,
   AppState,
   BackHandler,
+  Easing,
   FlatList,
   Image,
   type LayoutChangeEvent,
-  ScrollView,
   StyleSheet,
   Text,
   View,
 } from 'react-native';
 import { TVFocusGuideView } from '@amazon-devices/react-native-kepler';
-import { Focusable } from '../components/Focusable';
+import { Focusable, useFocusScale } from '../components/Focusable';
 import { PosterRow } from '../components/PosterRow';
-import { Hero, HeroBackdrop, SCRIM_GRADIENT } from '../components/Hero';
+import { Hero, HeroBackdrop, SCRIM_GRADIENT, SCRIM_SIDE_GRADIENT } from '../components/Hero';
 import { TopNav } from '../components/TopNav';
+import { TrailerSurface } from '../components/TrailerSurface';
+import { getTrailer, startTrailer, stopTrailer, trailerFinished } from '../player/trailerController';
 import { catalog, meta as fetchMeta } from '../addons/client';
+import { trailerIdFor } from '../addons/trailers';
+import { backdropThumb, posterThumb, stillThumb } from '../addons/images';
 import { fetchAnimazeRows, type AnimazeRow } from '../addons/animaze';
 import { loadHistory, progressFractionFor, removeWatched, subscribeHistory } from '../storage/history';
 import { colors, glow, radius, spacing } from '../theme';
@@ -50,9 +54,35 @@ async function firstLoadingImage(candidates: string[]): Promise<string | null> {
   return null;
 }
 
+// Downloads artwork before it's needed, once per URL per session. The hero
+// used to start each backdrop download only when its title was focused, and
+// held the old title on screen until it arrived — that wait was the
+// "artwork takes a second to come in" lag. Fetching the neighbours of
+// whatever is focused means the next one is normally already local.
+const prefetched = new Set<string>();
+function prefetchImage(url: string | undefined) {
+  if (!url || prefetched.has(url)) return;
+  prefetched.add(url);
+  Image.prefetch(url).catch(() => prefetched.delete(url));
+}
+
 type Props = NativeStackScreenProps<RootStackParamList, 'Home'>;
 
-const FOCUS_DEBOUNCE_MS = 150;
+// Long enough that holding the D-pad down a row doesn't rebuild the hero for
+// every card it passes — that churn competed with the row's own scrolling
+// for the JS thread — and short enough to still feel immediate on a pause.
+const FOCUS_DEBOUNCE_MS = 200;
+
+// Trailer timing, measured from the moment a card takes focus. Loading
+// starts early (stream lookup, player set-up, the first second of video) so
+// that by TRAILER_PLAY_MS it's ready and simply starts — waiting the full
+// delay first and only then loading is what made it take ~4 s.
+const TRAILER_LOAD_MS = 900;
+const TRAILER_PLAY_MS = 2000;
+
+// How long focus has to rest before the title's full details are fetched
+// ahead of a possible open.
+const META_PREFETCH_MS = 900;
 
 // Continue Watching renders this many cards until "Show all" is pressed.
 // Each card holds a decoded 16:9 still, so the tail of a long history is real
@@ -87,6 +117,7 @@ const ContinueWatchingCard = React.memo(React.forwardRef<
   ref,
 ) {
   const [focused, setFocused] = useState(false);
+  const { scale, animateTo } = useFocusScale(1.05);
   // The episode's own still frame when we have one — it's already 16:9, which
   // is this card's shape, and it says far more about where you left off than
   // the series poster does.
@@ -99,7 +130,10 @@ const ContinueWatchingCard = React.memo(React.forwardRef<
   // Each candidate is checked before it's shown (see imageLoads), and the
   // image's own error callback still advances the chain if it does fire.
   const [failedCount, setFailedCount] = useState(0);
-  const candidates = ([item.episodeThumbnail, item.background, item.poster].filter(Boolean) as string[]).slice(failedCount);
+  // Each at the size this 150-wide tile actually needs (see addons/images).
+  const candidates = (
+    [stillThumb(item.episodeThumbnail), backdropThumb(item.background), posterThumb(item.poster)].filter(Boolean) as string[]
+  ).slice(failedCount);
   const candidatesKey = candidates.join('|');
   // undefined while checking, null when none of them load.
   const [image, setImage] = useState<string | null | undefined>(undefined);
@@ -127,11 +161,18 @@ const ContinueWatchingCard = React.memo(React.forwardRef<
       onLongPress={onArmRemove}
       onFocus={() => {
         setFocused(true);
+        animateTo(true);
         onFocus();
       }}
-      onBlur={() => setFocused(false)}
+      onBlur={() => {
+        setFocused(false);
+        animateTo(false);
+      }}
       hasTVPreferredFocus={hasTVPreferredFocus}
       style={styles.cwCard}>
+      {/* The still and everything drawn over it lift together; the titles
+          underneath stay put. */}
+      <Animated.View style={{ transform: [{ scale }] }}>
       {image ? (
         <Image
           key={image}
@@ -163,6 +204,7 @@ const ContinueWatchingCard = React.memo(React.forwardRef<
           <Text style={styles.cwConfirmHint}>Press OK</Text>
         </View>
       )}
+      </Animated.View>
       <Text style={styles.cwTitle} numberOfLines={1}>
         {displayName}
       </Text>
@@ -184,8 +226,19 @@ const ContinueWatchingCard = React.memo(React.forwardRef<
 // drives it. This also avoids the feedback loop an earlier scroll-linked
 // version had, where shrinking the hero grew the scrollable viewport, which
 // revealed more content, which fed back into the collapse.
+//
+// The collapse is a SLIDE, not a resize: the hero is always HERO_EXPANDED
+// tall and moves up by HERO_COLLAPSE on the native driver, with its artwork
+// counter-shifted so the picture itself stays still while the bottom edge
+// rises. It used to animate `height`, which can't use the native driver —
+// every frame re-ran layout for the hero AND the equally tall spacer at the
+// top of the ScrollView, i.e. the whole page, on the JS thread, at the same
+// moment the rows were scrolling. That was the main source of the jank
+// moving between Continue Watching and the rows below it.
 const HERO_EXPANDED = 320;
 const HERO_COMPACT = 205;
+const HERO_COLLAPSE = HERO_EXPANDED - HERO_COMPACT;
+const HERO_SLIDE_MS = 280;
 
 // Gap left between the bottom of the hero and the top of the focused row.
 //
@@ -196,6 +249,7 @@ const HERO_COMPACT = 205;
 // breathing room comes from the hero's own bottom padding, which is part of
 // the hero's opaque area and therefore can't leak.
 const ROW_GAP = spacing.xs;
+
 
 export function HomeScreen({ navigation }: Props) {
   const [movies, setMovies] = useState<Meta[]>([]);
@@ -215,16 +269,25 @@ export function HomeScreen({ navigation }: Props) {
   const metaCacheRef = useRef<Map<string, Meta>>(new Map());
   const latestFocusKeyRef = useRef<string | null>(null);
   const focusDebounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const metaPrefetchRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   // Each row's y offset *within the rows container* (not the scroll content
   // — see onCardFocus for why that distinction matters), reported by its own
   // onLayout. Used to scroll a focused row clear of the pinned hero.
-  const scrollRef = useRef<ScrollView>(null);
+  // The rows move as one block on the native driver — no ScrollView. See
+  // onCardFocus.
+  const rowsShift = useRef(new Animated.Value(0)).current;
   const rowOffsetsRef = useRef<Map<string, number>>(new Map());
-  const measureRow = useCallback(
-    (key: string) => (e: LayoutChangeEvent) => rowOffsetsRef.current.set(key, e.nativeEvent.layout.y),
-    [],
-  );
+  // Cached per key for the same reason as registerRowGuide below.
+  const measureCallbacksRef = useRef(new Map<string, (e: LayoutChangeEvent) => void>());
+  const measureRow = useCallback((key: string) => {
+    let cb = measureCallbacksRef.current.get(key);
+    if (!cb) {
+      cb = (e: LayoutChangeEvent) => rowOffsetsRef.current.set(key, e.nativeEvent.layout.y);
+      measureCallbacksRef.current.set(key, cb);
+    }
+    return cb;
+  }, []);
 
   // A real cross-dissolve: both titles are on screen at once, the outgoing
   // one at 1-t and the incoming one at t, so total coverage stays at 1
@@ -264,7 +327,7 @@ export function HomeScreen({ navigation }: Props) {
       setOutgoingItem(displayItemRef.current);
       setDisplayItem(focusedItem);
       fade.setValue(0);
-      Animated.timing(fade, { toValue: 1, duration: 300, useNativeDriver: true }).start(({ finished }) => {
+      Animated.timing(fade, { toValue: 1, duration: 240, useNativeDriver: true }).start(({ finished }) => {
         // Drop the outgoing layer only once it's fully hidden, so the
         // unmount can't show through.
         if (finished) setOutgoingItem(null);
@@ -282,7 +345,7 @@ export function HomeScreen({ navigation }: Props) {
       begin();
       return;
     }
-    const timeout = setTimeout(begin, 700);
+    const timeout = setTimeout(begin, 450);
     Image.prefetch(uri)
       .then(begin)
       .catch(begin)
@@ -313,21 +376,39 @@ export function HomeScreen({ navigation }: Props) {
     Animated.timing(navOpacity, { toValue: atTopRow ? 1 : 0, duration: 200, useNativeDriver: true }).start();
   }, [atTopRow, navOpacity]);
 
-  // Height, not opacity, so it can't use the native driver. That's fine: this
-  // fires once per row change, not once per scroll frame.
-  const heroHeight = useRef(new Animated.Value(HERO_EXPANDED)).current;
+  // See HERO_COLLAPSE. Same duration and easing as the rows' own move (see
+  // onCardFocus), so the hero's edge and the rows travel together. Before the hero is first drawn it just jumps to the right
+  // place — there's nothing on screen to animate yet.
+  const heroShift = useRef(new Animated.Value(0)).current;
+  const backdropShift = useRef(Animated.multiply(heroShift, -1)).current;
+  const heroShown = displayItem !== null;
   useEffect(() => {
-    // eslint-disable-next-line @amazon-devices/kepler/animated
-    Animated.timing(heroHeight, {
-      toValue: onCWRow ? HERO_EXPANDED : HERO_COMPACT,
-      duration: 220,
-      // Height is a layout property — the native driver only handles
-      // transform and opacity, so this genuinely cannot run on the UI
-      // thread. It fires once per row change, not per frame.
-      // eslint-disable-next-line @amazon-devices/kepler/animated
-      useNativeDriver: false,
+    const toValue = onCWRow ? 0 : -HERO_COLLAPSE;
+    if (!heroShown) {
+      heroShift.setValue(toValue);
+      return;
+    }
+    Animated.timing(heroShift, {
+      toValue,
+      duration: HERO_SLIDE_MS,
+      easing: Easing.out(Easing.cubic),
+      useNativeDriver: true,
     }).start();
-  }, [onCWRow, heroHeight]);
+  }, [onCWRow, heroShown, heroShift]);
+
+  // Netflix-style trailer: whichever title focus rests on gets its trailer
+  // in the hero (player/trailerController owns the playback). Any focus move
+  // stops it, as does leaving the app or the screen — except opening that
+  // same title, where Detail carries the trailer on full screen.
+  const trailerTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const focusTokenRef = useRef(0);
+  // Set by openDetail just before navigating, so the blur that follows
+  // knows to leave that title's trailer running.
+  const handoffItemRef = useRef<string | null>(null);
+  const cancelTrailer = useCallback(() => {
+    if (trailerTimerRef.current) clearTimeout(trailerTimerRef.current);
+    stopTrailer();
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -360,6 +441,7 @@ export function HomeScreen({ navigation }: Props) {
   useEffect(() => {
     return () => {
       if (focusDebounceRef.current) clearTimeout(focusDebounceRef.current);
+      if (metaPrefetchRef.current) clearTimeout(metaPrefetchRef.current);
     };
   }, []);
 
@@ -383,10 +465,6 @@ export function HomeScreen({ navigation }: Props) {
   const firstRowGuideRef = useRef<React.ComponentRef<typeof TVFocusGuideView>>(null);
   const restoreTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
-  // Which row last held focus, so coming back from a title returns you to
-  // that row (and, via its guide's own autoFocus, to that card) rather than
-  // dumping you at the top of Continue Watching every time.
-  const [activeRowKey, setActiveRowKey] = useState<string | null>(null);
   // Continue Watching's first card, named as an explicit focus destination
   // the same way PosterRow names its own. `autoFocus` alone was not enough:
   // it restores whichever card last had focus, and the horizontal list
@@ -395,14 +473,23 @@ export function HomeScreen({ navigation }: Props) {
   // moving up into this row work only sometimes.
   const [firstCwCard, setFirstCwCard] = useState<React.ComponentRef<typeof Focusable> | null>(null);
   const rowGuidesRef = useRef(new Map<string, unknown>());
-  const registerRowGuide = useCallback(
-    (key: string) => (node: unknown) => {
-      if (node) rowGuidesRef.current.set(key, node);
-      else rowGuidesRef.current.delete(key);
-      if (key === 'cw' || key === 'movies') firstRowGuideRef.current = node as never;
-    },
-    [],
-  );
+  // One callback per row key, kept for the screen's lifetime. Handing each
+  // row a fresh callback every render (as this used to) gave every memo'd
+  // PosterRow a changed prop on every Home render — i.e. on every D-pad
+  // press — so all of them re-rendered, carousels included.
+  const guideCallbacksRef = useRef(new Map<string, (node: unknown) => void>());
+  const registerRowGuide = useCallback((key: string) => {
+    let cb = guideCallbacksRef.current.get(key);
+    if (!cb) {
+      cb = (node: unknown) => {
+        if (node) rowGuidesRef.current.set(key, node);
+        else rowGuidesRef.current.delete(key);
+        if (key === 'cw' || key === 'movies') firstRowGuideRef.current = node as never;
+      };
+      guideCallbacksRef.current.set(key, cb);
+    }
+    return cb;
+  }, []);
 
   // requestTVFocus is Kepler's own addition to View's imperative handle; it
   // isn't in the shipped TVFocusGuideView typings.
@@ -451,9 +538,14 @@ export function HomeScreen({ navigation }: Props) {
     };
     const onScreenBlur = () => {
       screenFocusedRef.current = false;
+      if (trailerTimerRef.current) clearTimeout(trailerTimerRef.current);
+      const handoff = handoffItemRef.current;
+      handoffItemRef.current = null;
+      if (!handoff || getTrailer()?.itemId !== handoff) stopTrailer();
     };
     const onAppState = (state: string) => {
       if (state === 'active' && screenFocusedRef.current) restoreFocus(150);
+      else if (state !== 'active') cancelTrailer();
     };
     const unsubFocus = navigation.addListener('focus', onScreenFocus);
     const unsubBlur = navigation.addListener('blur', onScreenBlur);
@@ -463,35 +555,63 @@ export function HomeScreen({ navigation }: Props) {
       unsubBlur();
       appStateSub.remove();
       if (restoreTimerRef.current) clearTimeout(restoreTimerRef.current);
+      if (trailerTimerRef.current) clearTimeout(trailerTimerRef.current);
     };
-  }, [navigation, restoreFocus]);
+  }, [navigation, restoreFocus, cancelTrailer]);
 
   const onCardFocus = useCallback((item: Meta, row: { key: string; top: boolean; continueWatching: boolean }) => {
     setAtTopRow(row.top);
     setOnCWRow(row.continueWatching);
-    setActiveRowKey(row.key);
 
-    // The platform auto-scrolls a newly focused card into view, but it has no
-    // idea the hero is floating over the top of the viewport — so a row it
-    // considers "visible" can still be sitting underneath it. Worse, it only
-    // ever scrolls in one direction: moving focus DOWN pushes a card off the
-    // bottom so it scrolls (minimally, leaving a gap), while moving focus UP
-    // leaves the card technically inside the viewport — just hidden behind
-    // the hero — so it doesn't scroll at all. Drive it ourselves instead.
+    // Restart the trailer countdown for this title (see TRAILER_LOAD_MS).
+    // Continue Watching entries don't carry trailer ids, so those come from
+    // the title's full record — normally already cached by then.
+    const focusAt = Date.now();
+    const token = ++focusTokenRef.current;
+    if (trailerTimerRef.current) clearTimeout(trailerTimerRef.current);
+    if (getTrailer()?.itemId !== item.id) stopTrailer();
+    trailerTimerRef.current = setTimeout(async () => {
+      if (!screenFocusedRef.current || trailerFinished(item.id)) return;
+      let ytId = trailerIdFor(item);
+      if (!ytId) {
+        const full = await fetchMeta(item.type, item.id);
+        if (token !== focusTokenRef.current) return;
+        ytId = full ? trailerIdFor(full) : undefined;
+      }
+      if (ytId && screenFocusedRef.current) startTrailer(item.id, ytId, focusAt + TRAILER_PLAY_MS);
+    }, TRAILER_LOAD_MS);
+
+    // Park the focused row just under the hero. This used to be a ScrollView
+    // scrollTo, which ran its own animation alongside the hero's slide —
+    // two separately timed motions — and on top of whatever the platform's
+    // own focus auto-scroll decided to do. Now the whole block of rows is
+    // moved with one native-driver transform, on exactly the hero's
+    // duration and easing, so rows and hero move as one.
     //
-    // Offsets are measured relative to the rows container, NOT the scroll
-    // content, which is the important part: the spacer above that container
-    // is exactly as tall as the hero, so `contentY = heroHeight + rowY` and
-    // the scroll needed to park a row at `heroHeight + gap` reduces to just
-    // `rowY - gap` — with the hero height cancelling out. Measuring against
-    // the scroll content instead made the offsets depend on whatever the
-    // spacer happened to be mid-animation, which is what broke the Continue
-    // Watching -> Movies step specifically: those offsets were captured
-    // while the hero was still expanded, then used after it had collapsed.
+    // Offsets are measured relative to the rows container. The spacer above
+    // that container is a fixed HERO_EXPANDED, so
+    // `contentY = HERO_EXPANDED + rowY`, and parking a row just under the
+    // hero's visible bottom edge (HERO_EXPANDED, or HERO_COMPACT once it has
+    // slid up) needs `rowY - gap`, plus HERO_COLLAPSE when compact. Nothing
+    // here depends on where an animation happens to be.
     const rowY = rowOffsetsRef.current.get(row.key);
     if (rowY !== undefined) {
-      scrollRef.current?.scrollTo({ y: Math.max(0, rowY - ROW_GAP), animated: true });
+      const y = rowY - ROW_GAP + (row.continueWatching ? 0 : HERO_COLLAPSE);
+      Animated.timing(rowsShift, {
+        toValue: -Math.max(0, y),
+        duration: HERO_SLIDE_MS,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }).start();
     }
+
+    // Once focus has settled, look the title up in the background so opening
+    // it draws its full details straight away. Not on every pass-through:
+    // a long series' meta is a big JSON parse on the JS thread.
+    if (metaPrefetchRef.current) clearTimeout(metaPrefetchRef.current);
+    metaPrefetchRef.current = setTimeout(() => {
+      fetchMeta(item.type, item.id).catch(() => {});
+    }, META_PREFETCH_MS);
 
     if (focusDebounceRef.current) clearTimeout(focusDebounceRef.current);
     focusDebounceRef.current = setTimeout(() => {
@@ -521,7 +641,7 @@ export function HomeScreen({ navigation }: Props) {
         setFocusedItem(full ?? item); // fall back to the sparse item if Cinemeta has nothing for it
       });
     }, FOCUS_DEBOUNCE_MS);
-  }, []);
+  }, [rowsShift]);
 
   // Path 3 above: once the catalog has actually rendered there is finally a
   // row to hand focus to. Runs on the loading -> loaded edge only.
@@ -546,7 +666,12 @@ export function HomeScreen({ navigation }: Props) {
   }, [loading, error, history, movies]);
 
   const openDetail = useCallback(
-    (item: Meta) => navigation.navigate('Detail', { id: item.id, type: item.type }),
+    // The catalog entry goes along so Detail can draw the title, art and
+    // description immediately rather than opening on a spinner.
+    (item: Meta) => {
+      handoffItemRef.current = item.id;
+      navigation.navigate('Detail', { id: item.id, type: item.type, initial: item });
+    },
     [navigation],
   );
 
@@ -598,13 +723,34 @@ export function HomeScreen({ navigation }: Props) {
   // PosterRow is memo'd, which only helps if the handlers it receives keep
   // their identity across renders — an inline arrow would be a new function
   // on every hero change and defeat the memo entirely. Cached per row key.
-  const focusHandlersRef = useRef(new Map<string, (item: Meta) => void>());
+  //
+  // Each focus also prefetches what the next presses will need: the hero
+  // backdrops either side of this card, posters just past the row's
+  // rendered window, and the backdrop of the card the rows above and below
+  // would land on (each row remembers its own position).
+  const rowDataRef = useRef(new Map<string, Meta[]>());
+  const rowOrderRef = useRef<string[]>([]);
+  const rowIndexRef = useRef(new Map<string, number>());
+  const focusHandlersRef = useRef(new Map<string, (item: Meta, index: number) => void>());
   const getRowFocusHandler = useCallback(
     (key: string, top: boolean) => {
       const cacheKey = `${key}:${top}`;
       const existing = focusHandlersRef.current.get(cacheKey);
       if (existing) return existing;
-      const fn = (item: Meta) => onCardFocus(item, { key, top, continueWatching: false });
+      const fn = (item: Meta, index: number) => {
+        onCardFocus(item, { key, top, continueWatching: false });
+        rowIndexRef.current.set(key, index);
+        const data = rowDataRef.current.get(key) ?? [];
+        for (const i of [index + 1, index - 1, index + 2]) prefetchImage(data[i]?.background);
+        for (let i = index + 12; i < index + 17; i++) prefetchImage(posterThumb(data[i]?.poster));
+        const order = rowOrderRef.current;
+        const at = order.indexOf(key);
+        for (const neighbour of [order[at - 1], order[at + 1]]) {
+          if (!neighbour) continue;
+          const nData = rowDataRef.current.get(neighbour) ?? [];
+          prefetchImage(nData[rowIndexRef.current.get(neighbour) ?? 0]?.background);
+        }
+      };
       focusHandlersRef.current.set(cacheKey, fn);
       return fn;
     },
@@ -647,6 +793,19 @@ export function HomeScreen({ navigation }: Props) {
     [removeArmedId, resumeEntry, onCardFocus, setFirstCwCard],
   );
 
+  // Poster rows in page order. All of them stay mounted: each carousel only
+  // ever holds ~15 small posters, so the whole page costs less than two of
+  // the old FlatList rows did — and swapping rows in and out as focus moved
+  // (an earlier version of this) put a carousel mount, with 15 image
+  // decodes, in the middle of every vertical move.
+  const posterRows: Array<{ key: string; title: string; data: Meta[] }> = [
+    { key: 'movies', title: 'Movies', data: movies },
+    { key: 'series', title: 'Series', data: series },
+    ...animazeRows.map(r => ({ key: r.title, title: r.title, data: r.data })),
+  ];
+  rowOrderRef.current = [...(history.length > 0 ? ['cw'] : []), ...posterRows.map(r => r.key)];
+  for (const r of posterRows) rowDataRef.current.set(r.key, r.data);
+
   const configured = isConfigured(getSettingsSync());
   const isContinueWatching = Boolean(displayItem && history.some(h => h.id === displayItem.id));
   // Movies is the first row only when there's no Continue Watching row above it.
@@ -666,14 +825,15 @@ export function HomeScreen({ navigation }: Props) {
       {error && <Text style={styles.error}>Failed to load catalog: {error}</Text>}
 
       {!loading && !error && (
-        <ScrollView ref={scrollRef} style={styles.rows} showsVerticalScrollIndicator={false}>
-          {/* Reserves exactly the pinned hero's height so the first row starts
-              below it. Shrinks in lockstep with the hero, which is what pulls
-              the rows up as it collapses. */}
-          <Animated.View style={{ height: heroHeight }} />
+        <View style={styles.rows}>
+          <Animated.View style={{ transform: [{ translateY: rowsShift }] }}>
+          {/* Reserves the expanded hero's height so the first row starts
+              below it. Fixed: when the hero slides up to compact, onCardFocus
+              scrolls the extra HERO_COLLAPSE instead, so nothing above the
+              rows ever changes size. */}
+          <View style={styles.heroSpacer} />
 
-          {/* Every row's onLayout y is relative to THIS container, so the
-              spacer's animating height never leaks into the measurements. */}
+          {/* Every row's onLayout y is relative to THIS container. */}
           <View>
           {history.length > 0 && (
             <View style={styles.row} onLayout={measureRow('cw')}>
@@ -728,68 +888,64 @@ export function HomeScreen({ navigation }: Props) {
             </View>
           )}
 
-          <View onLayout={measureRow('movies')}>
-            <PosterRow
-              title="Movies"
-              data={movies}
-              onSelect={openDetail}
-              onItemFocus={getRowFocusHandler('movies', moviesIsFirstRow)}
-              autoFocusFirst={moviesIsFirstRow}
-              guideRef={registerRowGuide('movies')}
-              restoreLastFocused={activeRowKey === 'movies'}
-            />
-          </View>
-          <View onLayout={measureRow('series')}>
-            <PosterRow
-              title="Series"
-              data={series}
-              onSelect={openDetail}
-              onItemFocus={getRowFocusHandler('series', false)}
-              guideRef={registerRowGuide('series')}
-              restoreLastFocused={activeRowKey === 'series'}
-            />
-          </View>
-
-          {animazeRows.map(row => (
-            <View key={row.title} onLayout={measureRow(row.title)}>
-              <PosterRow
-                title={row.title}
-                data={row.data}
-                onSelect={openDetail}
-                onItemFocus={getRowFocusHandler(row.title, false)}
-                guideRef={registerRowGuide(row.title)}
-                restoreLastFocused={activeRowKey === row.title}
-              />
-            </View>
-          ))}
+          {posterRows.map(row =>
+            row.data.length === 0 ? null : (
+              <View key={row.key} onLayout={measureRow(row.key)}>
+                <PosterRow
+                  title={row.title}
+                  data={row.data}
+                  onSelect={openDetail}
+                  onItemFocus={getRowFocusHandler(row.key, row.key === 'movies' && moviesIsFirstRow)}
+                  autoFocusFirst={row.key === 'movies' && moviesIsFirstRow}
+                  guideRef={registerRowGuide(row.key)}
+                />
+              </View>
+            ),
+          )}
           </View>
 
           {/* The last row still needs to be able to scroll clear of the
               pinned hero above it, so the content has to be able to run
               past the bottom of the viewport by roughly a hero's worth. */}
           <View style={styles.tailSpacer} />
-        </ScrollView>
+          </Animated.View>
+        </View>
       )}
 
       {/* Pinned above the rows, below the nav. The rows slide up behind it
           rather than pushing it away — Hero's own backdrop is opaque, so
           that reads as content passing underneath. */}
       {displayItem && (
-        <Animated.View style={[styles.heroPinned, { height: heroHeight }]}>
-          {/* Layer order matters here. Backdrops cross-fade, then ONE static
-              scrim, then the text cross-fades over it. Previously each Hero
-              carried its own scrim, so cross-fading two Heroes cross-faded
-              two identical gradients — which read as the gradient pulsing on
-              every title change. */}
-          {outgoingItem && outgoingItem.id !== displayItem.id && (
-            <Animated.View style={[StyleSheet.absoluteFill, { opacity: outgoingOpacity }]} pointerEvents="none">
-              <HeroBackdrop item={outgoingItem} />
+        <Animated.View style={[styles.heroPinned, { transform: [{ translateY: heroShift }] }]}>
+          {/* Layer order matters here. Backdrops cross-fade (with the trailer
+              over them), then ONE static scrim, then the text cross-fades
+              over it. Previously each Hero carried its own scrim, so
+              cross-fading two Heroes cross-faded two identical gradients —
+              which read as the gradient pulsing on every title change.
+
+              The artwork group is counter-shifted against the hero's slide,
+              so the picture stays where it is on screen and only the hero's
+              bottom edge moves. */}
+          <Animated.View
+            style={[StyleSheet.absoluteFill, { transform: [{ translateY: backdropShift }] }]}
+            pointerEvents="none">
+            {outgoingItem && outgoingItem.id !== displayItem.id && (
+              <Animated.View style={[StyleSheet.absoluteFill, { opacity: outgoingOpacity }]}>
+                <HeroBackdrop item={outgoingItem} />
+              </Animated.View>
+            )}
+            <Animated.View style={[StyleSheet.absoluteFill, { opacity: fade }]}>
+              <HeroBackdrop item={displayItem} />
             </Animated.View>
-          )}
-          <Animated.View style={[StyleSheet.absoluteFill, { opacity: fade }]} pointerEvents="none">
-            <HeroBackdrop item={displayItem} />
+            <TrailerSurface
+              itemId={displayItem.id}
+              // Exactly the visible hero, so nothing relies on the hero's
+              // clipping to keep video off the rows below.
+              style={onCWRow ? styles.trailerExpanded : styles.trailerCompact}
+            />
           </Animated.View>
           <View style={[StyleSheet.absoluteFill, { experimental_backgroundImage: SCRIM_GRADIENT }]} pointerEvents="none" />
+          <View style={[StyleSheet.absoluteFill, { experimental_backgroundImage: SCRIM_SIDE_GRADIENT }]} pointerEvents="none" />
 
           {outgoingItem && outgoingItem.id !== displayItem.id && (
             <Animated.View style={[StyleSheet.absoluteFill, { opacity: outgoingOpacity }]} pointerEvents="none">
@@ -853,17 +1009,22 @@ const styles = StyleSheet.create({
 
   navOverlay: { position: 'absolute', top: 0, left: 0, right: 0, zIndex: 10 },
 
-  rows: { flex: 1 },
+  // Clips the rows block as it slides up under the hero.
+  rows: { flex: 1, overflow: 'hidden' },
+  trailerExpanded: { height: HERO_EXPANDED },
+  trailerCompact: { height: HERO_COMPACT },
   // Below navOverlay's zIndex (10) so the nav still draws over the hero art.
   heroPinned: {
     position: 'absolute',
     top: 0,
     left: 0,
     right: 0,
+    height: HERO_EXPANDED,
     zIndex: 5,
     backgroundColor: colors.background,
     overflow: 'hidden',
   },
+  heroSpacer: { height: HERO_EXPANDED },
   heroFade: { flex: 1 },
   tailSpacer: { height: HERO_EXPANDED },
   row: { marginBottom: spacing.md },

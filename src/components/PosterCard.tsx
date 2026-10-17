@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
-import { Image, Pressable, StyleSheet, Text, View } from 'react-native';
-import { Focusable } from './Focusable';
+import { Animated, Image, Pressable, StyleSheet, Text, View } from 'react-native';
+import { Focusable, useFocusScale } from './Focusable';
 import { colors, glow, radius } from '../theme';
+import { posterThumb } from '../addons/images';
 import type { Meta } from '../types';
 
 type PosterCardProps = {
@@ -9,6 +10,9 @@ type PosterCardProps = {
   onPress: () => void;
   onFocus?: () => void;
   hasTVPreferredFocus?: boolean;
+  // No trailing margin: inside a Carousel the spacing is the carousel's
+  // own itemPadding.
+  flush?: boolean;
 };
 
 // Forwards a ref through to the underlying pressable so a row can name its
@@ -18,7 +22,7 @@ type PosterCardProps = {
 // on every single D-pad move — and without it each of those re-rendered
 // every mounted poster in every row.
 const PosterCardBase = React.forwardRef<React.ComponentRef<typeof Pressable>, PosterCardProps>(function PosterCard(
-  { item, onPress, onFocus, hasTVPreferredFocus },
+  { item, onPress, onFocus, hasTVPreferredFocus, flush },
   ref,
 ) {
   // `bare` on the Focusable — the focus ring is scoped to just the poster
@@ -26,6 +30,9 @@ const PosterCardBase = React.forwardRef<React.ComponentRef<typeof Pressable>, Po
   // text underneath it). This is the convention every other streaming app
   // uses: highlight the tile, not the label.
   const [focused, setFocused] = useState(false);
+  // Only the artwork lifts, on the native driver, so it eases in even while
+  // JS is busy with the hero update the same focus change kicks off.
+  const { scale, animateTo } = useFocusScale(1.06);
   return (
     <Focusable
       ref={ref}
@@ -33,20 +40,26 @@ const PosterCardBase = React.forwardRef<React.ComponentRef<typeof Pressable>, Po
       onPress={onPress}
       onFocus={() => {
         setFocused(true);
+        animateTo(true);
         onFocus?.();
       }}
-      onBlur={() => setFocused(false)}
+      onBlur={() => {
+        setFocused(false);
+        animateTo(false);
+      }}
       hasTVPreferredFocus={hasTVPreferredFocus}
-      style={styles.card}>
-      {item.poster ? (
-        <Image source={{ uri: item.poster }} style={[styles.image, focused && styles.imageFocused]} resizeMode="cover" />
-      ) : (
-        <View style={[styles.image, styles.placeholder, focused && styles.imageFocused]}>
-          <Text style={styles.placeholderText} numberOfLines={3}>
-            {item.name}
-          </Text>
-        </View>
-      )}
+      style={[styles.card, flush && styles.cardFlush]}>
+      <Animated.View style={{ transform: [{ scale }] }}>
+        {item.poster ? (
+          <Image source={{ uri: posterThumb(item.poster) }} style={[styles.image, focused && styles.imageFocused]} resizeMode="cover" />
+        ) : (
+          <View style={[styles.image, styles.placeholder, focused && styles.imageFocused]}>
+            <Text style={styles.placeholderText} numberOfLines={3}>
+              {item.name}
+            </Text>
+          </View>
+        )}
+      </Animated.View>
       {/* Verbatim from whatever catalog this card came from — for the
           Animaze rows that's the AniList-specific title (e.g. "Fire Force
           Season 3"), never normalized down to the general show name. The
@@ -63,14 +76,20 @@ export const PosterCard = React.memo(PosterCardBase);
 
 // Slightly smaller than a "natural" poster tile on purpose: every pixel
 // saved here buys height for the pinned hero above without costing a row.
-const CARD_WIDTH = 106;
+export const CARD_WIDTH = 106;
 const IMAGE_HEIGHT = 142;
+// Fixed, not content-sized: the image, the title's gap and two title lines
+// (142 + 6 + 30). A one-line title used to make that card shorter than its
+// neighbours, and the Carousel sizes its slots from the item itself.
+export const CARD_HEIGHT = IMAGE_HEIGHT + 6 + 30;
 
 const styles = StyleSheet.create({
   card: {
     width: CARD_WIDTH,
+    height: CARD_HEIGHT,
     marginRight: 14,
   },
+  cardFlush: { marginRight: 0 },
   image: {
     width: '100%',
     height: IMAGE_HEIGHT,
