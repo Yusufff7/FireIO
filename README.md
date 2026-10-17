@@ -14,6 +14,7 @@ The interesting part of this project isn't the UI. It's **making MKV seekable on
 
 - [What it does](#what-it-does)
 - [The hard problem: MKV seeking](#the-hard-problem-mkv-seeking)
+- [A smooth 10-foot UI on a 1 GB stick](#a-smooth-10-foot-ui-on-a-1-gb-stick)
 - [Architecture](#architecture)
 - [Getting started](#getting-started)
 - [Testing without a device](#testing-without-a-device)
@@ -26,12 +27,13 @@ The interesting part of this project isn't the UI. It's **making MKV seekable on
 
 | | |
 |---|---|
-| **Catalogs & search** | Movie/series browsing backed by Stremio addons, with a focus-driven hero that updates as you move the D-pad |
+| **Catalogs & search** | Movie/series browsing backed by Stremio addons, on native TV carousels, with a focus-driven hero that updates as you move the D-pad |
+| **Trailers** | Rest on a title and its trailer starts in the hero after ~2 s, Netflix-style; open the title and the same playback carries on full screen |
 | **Continue Watching** | Per-episode resume with progress bars; resuming re-resolves a current source rather than pinning to a dead link |
 | **Playback** | HEVC/H.264 video; AAC, AC-3, E-AC-3, FLAC, Opus and (where the device decodes it) TrueHD audio |
 | **Seeking in MKV** | Real-time remux with an absolute timeline and the file's Cues index — instant within what's buffered, one fetch from the right keyframe outside it |
-| **Audio tracks** | Switch between an MKV's embedded audio tracks mid-playback, by language |
-| **Subtitles** | External (OpenSubtitles-style addons) *and* embedded MKV tracks (SRT/ASS/SSA), with styling and timing offset |
+| **Audio tracks** | Switch between an MKV's embedded audio tracks mid-playback, by language — remembered per show, across episodes and resumes |
+| **Subtitles** | External (OpenSubtitles-style addons) *and* embedded MKV tracks (SRT/ASS/SSA), with styling and timing offset — the choice is remembered per show too |
 | **Backup sources** | A second set of addons to switch to in one press when the service behind your main set is down |
 | **Next episode** | Auto-derived from series metadata, so it works when resuming too |
 | **Skip intro/outro** | Chapter-aware skip prompts where timing data is available |
@@ -102,6 +104,19 @@ One more that only showed up on the device: every fragment needs an explicit dec
 
 ---
 
+## A smooth 10-foot UI on a 1 GB stick
+
+The second hard problem was making Home feel like a first-party TV app — instant focus, rows that glide, a hero that never waits for its artwork — on a stick with 1 GB of RAM shared with the OS. Almost none of the jank turned out to be where it looked.
+
+- **Memory was the real cause of "slow artwork".** Catalog posters arrive as 500×750 images — 1.5 MB each once decoded — for tiles drawn at 159×213 pixels, and every row kept dozens of them alive. The device log showed the system trimming the app's image cache under memory pressure, so art that had already loaded had to load again. Every image is now requested at the size it's drawn (posters, episode stills and small backdrops each have their own rule), and the backdrops either side of the focused card are fetched ahead of time.
+- **Rows are native carousels.** The FlatList rows were replaced with Amazon's Vega Carousel, which recycles a fixed set of item views and runs its scroll animation natively. The focused card stays anchored at the start of the row and the row slides under it.
+- **The page moves as one native transform.** The hero used to collapse by animating its `height`, which can't run on the native driver, so every frame re-laid out the page on the JS thread while a ScrollView ran its own, separately timed scroll animation. Now the hero slides and the rows move with transforms on the same duration and easing, and nothing above the rows ever changes size.
+- **A D-pad press re-renders almost nothing.** Every row was memoised, but each one received a freshly created ref callback on every render, which quietly defeated the memo, so all nine rows re-rendered on every press. Per-row callbacks are now created once. Rows also stay mounted: an earlier version swapped far-away rows for placeholders, but that put a carousel mount and 15 image decodes in the middle of every vertical move.
+- **Trailers play natively, not in a browser.** A WebView playing YouTube's embed spun up a whole browser renderer per trailer and never reached playback before focus moved on. Instead, the app asks YouTube's player API for the direct H.264/AAC streams and feeds them through the same MediaSource pipeline the main player uses, in byte ranges kept ~20 s ahead of the playhead. Loading starts 0.9 s after a card takes focus, so the trailer is ready to start at the 2-second mark rather than only beginning to load then. A single controller owns the trailer's player, which is how opening a title carries the same playback onto the Detail page full screen, and a shared teardown chain stops it from overlapping the main player on the decoder.
+- **Opening a title is instant.** Detail draws straight away from the catalog entry Home already has, while the full record (episodes, cast) fills in. That record has usually been fetched already, once focus rested on the card.
+
+---
+
 ## Architecture
 
 ```
@@ -113,6 +128,8 @@ One more that only showed up on the device: every fragment needs an explicit dec
 │                    subtitles, skip times                 │
 │  player/mkvMse.ts  MSE session: fetch windows, feed the  │
 │                    remuxer, manage SourceBuffers, seek   │
+│  player/trailer…   Trailer playback shared by Home and   │
+│                    Detail, on the same MSE pipeline      │
 └───────────────────────────┬──────────────────────────────┘
                             │  Kepler TurboModule bridge
 ┌───────────────────────────▼──────────────────────────────┐
@@ -224,7 +241,7 @@ Building these under AddressSanitizer is how a memory-safety bug in the upstream
 FireIO/
 ├── src/                      React Native app
 │   ├── addons/               Stremio addon client + stream selection
-│   ├── player/mkvMse.ts      MSE session and seek logic
+│   ├── player/               MSE session and seek logic, trailer playback
 │   ├── screens/              Home · Detail · Search · Player
 │   └── storage/              Settings, history, preferences
 ├── MkvDemuxModule/           Native C++ turbo module
@@ -246,6 +263,7 @@ This is an active work in progress, and the MKV pipeline in particular is not fi
 - **DTS audio isn't remuxed, and TrueHD depends on the device.** TrueHD is remuxed, but whether the platform decodes it (rather than only passing it through over HDMI) varies. A file with no audio track the remux path can play falls back to direct-URL playback, which has sound but doesn't seek.
 - **Image-based subtitles (PGS, VobSub) aren't supported** — only text formats. Rendering bitmap subtitles is a separate problem.
 - **Embedded subtitle cues only exist for territory that's been fetched.** Cues for every text track are collected from each downloaded window, so switching tracks is instant for everything fetched so far — but after a large jump, the skipped-over region has no cues until playback returns to it.
+- **Trailers are previews of about a minute.** YouTube serves only the first ~60 seconds of each stream to clients without a proof-of-origin token, refusing any byte range past that point (a freshly resolved URL doesn't reset it), so a trailer plays its first minute and fades back to the artwork. Trailers also rely on YouTube's player API, which isn't a public interface and could change.
 - **B-frame presentation timing is approximate.** The remuxer uses each track's nominal constant frame duration rather than full composition-time offsets, which keeps decode order correct at the cost of exact sub-frame display timing.
 
 ---
