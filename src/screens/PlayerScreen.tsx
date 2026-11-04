@@ -23,6 +23,7 @@ import {
 import { getSkipTimes, type SkipTimes } from '../addons/skipTimes';
 import { MkvMseSession } from '../player/mkvMse';
 import { pendingTeardown, trackTeardown } from '../player/sharedDecoder';
+import { describeSource, getSourcePrefSync, saveSourcePref } from '../storage/sourcePrefs';
 import { bestTrackMatch, canonicalLang } from '../addons/languages';
 import type { MkvDemuxAudioTrack, MkvDemuxSubtitleTrack } from '@amazon-devices/mkvdemuxmodule';
 import { getHistorySync, recordWatched, resumePositionFor, saveProgress } from '../storage/history';
@@ -91,6 +92,34 @@ const SEEK_SETTLE_MS = 1200;
 // it is worth offering. Below this the credits ARE the end of the episode,
 // so "next episode" is the useful action instead.
 const ENDING_TAIL_MIN_SEC = 30;
+
+// How long a Skip Intro / Skip Ending / Next Episode prompt stays up.
+const BANNER_VISIBLE_MS = 15000;
+
+// Remote keys that are input TO the player — D-pad, OK and the transport
+// keys — and so bring the controls up. Everything else the system delivers
+// (volume_up / volume_down / mute, channel keys, number keys) is ignored.
+// `rewind` / `forward` aren't in Kepler's typed list but are what some
+// remotes send for the transport keys, so they're kept alongside skip_*.
+const PLAYER_KEYS = new Set([
+  'up',
+  'down',
+  'left',
+  'right',
+  'left_up',
+  'left_down',
+  'right_up',
+  'right_down',
+  'select',
+  'enter',
+  'playpause',
+  'pause',
+  'stop',
+  'rewind',
+  'forward',
+  'skip_backward',
+  'skip_forward',
+]);
 // How long a source gets to actually start moving before the walk gives up
 // on it. Generous enough to cover a slow debrid link warming up, short
 // enough that a dead source doesn't hold the screen black.
@@ -362,9 +391,17 @@ export function PlayerScreen({ route, navigation }: Props) {
   // What the Resolution menu pick overrides to — seeded from Continue
   // Watching/next-episode's remembered preference where present.
   const [userResolution, setUserResolution] = useState<string | undefined>(preferredResolution);
+  // The show's last-watched source goes first (see storage/sourcePrefs) —
+  // unless a resolution has been picked from the menu since, which is an
+  // explicit "not that one".
+  const sourcePref = useMemo(() => getSourcePrefSync(type === 'series' ? id.split(':')[0] : id), [id, type]);
   const candidates = useMemo(
-    () => orderCandidates(allStreams, { resolution: userResolution }),
-    [allStreams, userResolution],
+    () =>
+      orderCandidates(allStreams, {
+        resolution: userResolution,
+        source: sourcePref && userResolution === preferredResolution ? { pref: sourcePref, episodeId: id } : undefined,
+      }),
+    [allStreams, userResolution, sourcePref, preferredResolution, id],
   );
   const resOptions = useMemo(() => availableResolutions(allStreams), [allStreams]);
 
@@ -693,9 +730,15 @@ export function PlayerScreen({ route, navigation }: Props) {
           // often. This loop is self-contained specifically so that mistake
           // can't recur: it owns its own retry, and every other seek in the
           // screen is a bare, ungated write.
+          // The saved position belongs to ONE episode — the entry's
+          // episodeId. Without that check, starting any other episode of the
+          // show (next episode included) seeked to the previous episode's
+          // timestamp, which near the end of an episode meant landing in
+          // the new one's credits.
           const seriesKey = type === 'series' ? id.split(':')[0] : id;
           const entry = getHistorySync().find(h => h.id === seriesKey);
-          const resumeAt = entry ? resumePositionFor(entry) : 0;
+          const sameEpisode = entry && (type !== 'series' || entry.episodeId === id);
+          const resumeAt = entry && sameEpisode ? resumePositionFor(entry) : 0;
           if (resumeAt > 0) {
             let attempts = 0;
             const tryResume = () => {
@@ -750,6 +793,9 @@ export function PlayerScreen({ route, navigation }: Props) {
             isAnime,
             lastResolution: resolvedStream ? parseReleaseInfo(resolvedStream).resolution : userResolution,
           }).catch(() => {});
+          // Recorded only once playback has really started, so a source that
+          // fails to play never becomes the one tried first next time.
+          if (resolvedStream) saveSourcePref(historyId, describeSource(resolvedStream, id)).catch(() => {});
         } catch (e) {
           failThisSource(String(e));
         }
@@ -1121,6 +1167,12 @@ export function PlayerScreen({ route, navigation }: Props) {
     // press being swallowed. Let the BackHandler see the real state.
     if (evt.eventType === 'back' || evt.eventType === 'menu') return;
 
+    // Only keys that act on the player count as activity. Volume (and any
+    // other system key that reaches the app) used to fall through to
+    // bumpActivity() too, so turning the volume up popped the whole control
+    // overlay over the video.
+    if (!PLAYER_KEYS.has(evt.eventType)) return;
+
     bumpActivity();
 
     if (evt.eventType === 'playpause') {
@@ -1446,6 +1498,21 @@ export function PlayerScreen({ route, navigation }: Props) {
     ? { label: 'Next Episode', action: goToNextEpisode }
     : null;
 
+  // Each prompt shows for BANNER_VISIBLE_MS and then gets out of the way;
+  // ignored once, it stays gone for the rest of that episode rather than
+  // coming back every time you scrub past.
+  const bannerLabel = banner?.label ?? null;
+  const [expiredBanners, setExpiredBanners] = useState<ReadonlySet<string>>(() => new Set());
+  useEffect(() => {
+    setExpiredBanners(new Set());
+  }, [id]);
+  useEffect(() => {
+    if (!bannerLabel) return;
+    const t = setTimeout(() => setExpiredBanners(prev => new Set(prev).add(bannerLabel)), BANNER_VISIBLE_MS);
+    return () => clearTimeout(t);
+  }, [bannerLabel]);
+  const visibleBanner = banner && !expiredBanners.has(banner.label) ? banner : null;
+
   const applyStyle = (patch: Partial<SubtitleStyle>) => {
     setSubStyle(prev => ({ ...prev, ...patch }));
     saveSubtitleStyle(patch).catch(() => {});
@@ -1635,12 +1702,12 @@ export function PlayerScreen({ route, navigation }: Props) {
               appears so OK acts on it directly — there is nothing else
               focusable on screen at that moment — and the track panel
               suppresses both so it can't steal focus out of an open menu. */}
-          {!showTracks && banner && (
+          {!showTracks && visibleBanner && (
             <Focusable
-              onPress={banner.action}
+              onPress={visibleBanner.action}
               rounded
               style={[styles.sideBanner, controlsMounted && styles.sideBannerRaised]}>
-              <Text style={styles.sideBannerTitle}>{banner.label}</Text>
+              <Text style={styles.sideBannerTitle}>{visibleBanner.label}</Text>
             </Focusable>
           )}
 

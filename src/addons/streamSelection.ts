@@ -1,5 +1,6 @@
 import type { Stream } from '../types';
 import { parseReleaseInfo, resolveStream, type SniffedContainer } from './client';
+import { sourceMatchScore, type SourcePreference } from '../storage/sourcePrefs';
 
 // Not "highest resolution" — 1080p is the real default, with 720p/480p as
 // lighter fallbacks.
@@ -57,9 +58,31 @@ function walkBuckets(allStreams: Stream[], used: Set<Stream>): Stream[] {
 // available for this episode/release: they get the preference when possible
 // and a sane fallback the rest of the time, rather than a dead end. Every
 // input stream ends up in the result exactly once.
-export function orderCandidates(allStreams: Stream[], preferred?: { resolution?: string }): Stream[] {
+//
+// Ahead of even that: `preferred.source`, the source this show was last
+// watched from (see storage/sourcePrefs). Streams matching it go first,
+// best match first — the exact file when it's the same episode, otherwise
+// the same release run — so moving between episodes stays on the release
+// whose audio and subtitle tracks you'd already picked. If none of them
+// work, the walk carries on exactly as it would have without one.
+export function orderCandidates(
+  allStreams: Stream[],
+  preferred?: { resolution?: string; source?: { pref: SourcePreference; episodeId: string } },
+): Stream[] {
   const used = new Set<Stream>();
   const ordered: Stream[] = [];
+
+  if (preferred?.source) {
+    const { pref, episodeId } = preferred.source;
+    const matches = allStreams
+      .map((s, i) => ({ s, i, score: sourceMatchScore(s, pref, episodeId) }))
+      .filter(m => m.score > 0)
+      .sort((a, b) => b.score - a.score || a.i - b.i);
+    for (const m of matches) {
+      ordered.push(m.s);
+      used.add(m.s);
+    }
+  }
 
   if (preferred?.resolution) {
     const preferredPool = allStreams.filter(s => resolutionOf(s) === preferred.resolution);

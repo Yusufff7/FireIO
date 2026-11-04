@@ -3,6 +3,7 @@ import { ActivityIndicator, StyleSheet, View } from 'react-native';
 import { RootNavigator } from './navigation/RootNavigator';
 import { loadSettings } from './storage/settings';
 import { loadSubtitlePrefs } from './storage/subtitlePrefs';
+import { loadSourcePrefs } from './storage/sourcePrefs';
 import { colors } from './theme';
 
 // Named export — index.js does `import { App } from './src/App'`. A default
@@ -14,7 +15,7 @@ export const App = () => {
   useEffect(() => {
     // Both are read synchronously later (getSettingsSync / getSubtitleStyleSync),
     // so both have to be warmed before the first screen renders.
-    Promise.all([loadSettings(), loadSubtitlePrefs()]).finally(() => setReady(true));
+    Promise.all([loadSettings(), loadSubtitlePrefs(), loadSourcePrefs()]).finally(() => setReady(true));
   }, []);
 
   if (!ready) {
