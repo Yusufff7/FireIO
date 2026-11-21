@@ -33,13 +33,3 @@ MkvDemuxModule/build/
 MkvDemuxModule/test/build*/
 CMakeUserPresets.json
 buildinfo.json
-
-# Samsung (Tizen) port. config.local.js is generated from localDefaults.ts
-# and carries the same addon URLs (and so the same API key); .wgt packages
-# bundle it. The signature files are written into the app folder by
-# `tizen package` and are tied to your own Samsung certificate.
-tizen/**/config.local.js
-*.wgt
-tizen/**/author-signature.xml
-tizen/**/signature1.xml
-tizen/**/.manifest.tmp

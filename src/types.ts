@@ -23,9 +23,6 @@ export type Meta = {
   // `trailerStreams` carries the YouTube id directly; `trailers` is the
   // older shape, where `source` is the YouTube id.
   trailerStreams?: { title?: string; ytId?: string }[];
-  // A short label drawn over the card, e.g. "New: S8E3" — set by Home's
-  // discovery rows, never sent by Cinemeta.
-  badge?: string;
   trailers?: { source?: string; type?: string }[];
 };
 

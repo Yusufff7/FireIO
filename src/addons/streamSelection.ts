@@ -6,7 +6,7 @@ import { sourceMatchScore, type SourcePreference } from '../storage/sourcePrefs'
 // lighter fallbacks.
 const RESOLUTION_PRIORITY = ['1080p', '720p', '480p'];
 
-// 2160p saturates the source link and stalls far more than the quality gain
+// 2160p saturates the debrid link and stalls far more than the quality gain
 // is worth, so it is a genuine last resort.
 const LAST_RESORT_RESOLUTIONS = ['2160p'];
 
@@ -26,7 +26,7 @@ function resolutionOf(s: Stream): string {
 // see PlayerScreen's Audio Track menu — which makes a filename-guessed
 // language bucket at the release-picking level redundant at best and wrong
 // at worst (the guess was never more than a heuristic on scene-tag text).
-function walkBuckets(allStreams: Stream[], used: Set<Stream>, resolutionOrder?: string[]): Stream[] {
+function walkBuckets(allStreams: Stream[], used: Set<Stream>): Stream[] {
   const ordered: Stream[] = [];
   const take = (predicate: (s: Stream) => boolean) => {
     for (const s of allStreams) {
@@ -39,13 +39,6 @@ function walkBuckets(allStreams: Stream[], used: Set<Stream>, resolutionOrder?: 
   // 'other' sits between the ranked resolutions and the last-resort ones: a
   // stream RESOLUTION_PRIORITY doesn't recognise still deserves a shot
   // before falling all the way back to 2160p.
-  if (resolutionOrder) {
-    // A platform's own order (e.g. 4K first on a TV that plays it well),
-    // with anything it doesn't name after it.
-    for (const res of resolutionOrder) take(s => resolutionOf(s) === res);
-    take(() => true);
-    return ordered;
-  }
   for (const res of RESOLUTION_PRIORITY) take(s => resolutionOf(s) === res);
   take(s => resolutionOf(s) === 'other');
   for (const res of LAST_RESORT_RESOLUTIONS) take(s => resolutionOf(s) === res);
@@ -53,10 +46,6 @@ function walkBuckets(allStreams: Stream[], used: Set<Stream>, resolutionOrder?: 
   return ordered;
 }
 
-// `preferred.resolutionOrder` replaces that default walk — the Fire TV
-// Stick's 1080p-first order exists because 2160p saturates its link; a
-// Samsung TV plays 4K fine and asks for 2160p first.
-//
 // Every candidate stream, reordered by resolution: 1080p down to 480p, then
 // whatever RESOLUTION_PRIORITY doesn't recognise, then 2160p as a genuine
 // last resort. `streams()`'s own quality ordering is the final tiebreaker
@@ -78,11 +67,7 @@ function walkBuckets(allStreams: Stream[], used: Set<Stream>, resolutionOrder?: 
 // work, the walk carries on exactly as it would have without one.
 export function orderCandidates(
   allStreams: Stream[],
-  preferred?: {
-    resolution?: string;
-    source?: { pref: SourcePreference; episodeId: string };
-    resolutionOrder?: string[];
-  },
+  preferred?: { resolution?: string; source?: { pref: SourcePreference; episodeId: string } },
 ): Stream[] {
   const used = new Set<Stream>();
   const ordered: Stream[] = [];
@@ -101,13 +86,13 @@ export function orderCandidates(
 
   if (preferred?.resolution) {
     const preferredPool = allStreams.filter(s => resolutionOf(s) === preferred.resolution);
-    ordered.push(...walkBuckets(preferredPool, used, preferred.resolutionOrder));
+    ordered.push(...walkBuckets(preferredPool, used));
   }
 
   // Fallback pass: full default priority over whatever's left. When no
   // preference was given at all, this pass covers everything and the block
   // above is a no-op — same behavior as before preferences existed.
-  ordered.push(...walkBuckets(allStreams, used, preferred?.resolutionOrder));
+  ordered.push(...walkBuckets(allStreams, used));
   return ordered;
 }
 
