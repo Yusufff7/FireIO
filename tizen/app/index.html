@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=1920, height=1080">
+  <title>FireIO</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <!-- Samsung's native player draws video on a plane beneath the page; this
+       element is where it's told to put it (see platform/avplay.ts). -->
+  <object id="av-player" type="application/avplayer"></object>
+  <div id="root"></div>
+  <script src="$WEBAPIS/webapis/webapis.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

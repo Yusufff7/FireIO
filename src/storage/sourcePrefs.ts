@@ -28,6 +28,10 @@ export type SourcePreference = {
   releaseGroup?: string;
   resolution?: string;
   addon?: string;
+  // True when you chose it yourself (the Sources menu) rather than the app
+  // falling back to it — a deliberate choice outranks the app's own
+  // preferences (see the Samsung app's FLAC handling).
+  picked?: boolean;
 };
 
 const KEY = 'stremiovega:sourcePrefs:v1';
